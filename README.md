@@ -1,12 +1,12 @@
 # Omarchy Workflows
 
-> **v0.2.3:** fixes reuse across workflows by protecting the actual open Hyprland window addresses before the shutdown phase.
+> **v0.2.4:** fixes reuse across workflows by protecting the actual open Hyprland window addresses before the shutdown phase.
 
 A top-bar workflow/session launcher for Omarchy Quattro.
 
 Workflows lets you capture or build reusable desktop setups, then switch between them with one click. Each application can be assigned to a Hyprland workspace and can either reuse an existing window or launch a new one.
 
-## v0.2.3 highlights
+## v0.2.4 highlights
 
 - Searchable **application picker** powered by Quickshell `DesktopEntries`
 - Picker works with normal apps, Flatpaks and Omarchy web apps that expose `.desktop` entries
@@ -187,7 +187,7 @@ rm -f ~/.config/hypr/omarchy_workflows_startup.lua
 
 Then remove the marked `omarchy-workflows` block from `~/.config/hypr/autostart.lua` if a login workflow was enabled.
 
-## v0.2.3 reuse semantics
+## v0.2.4 reuse semantics
 
 - Selecting the workflow that is already active is **idempotent**: no windows are closed. Existing matching windows are moved back to their configured workspaces and only missing apps are launched.
 - `Reuse existing` now protects matching target windows before shutdown, including in the broad close mode.
@@ -195,7 +195,7 @@ Then remove the marked `omarchy-workflows` block from `~/.config/hypr/autostart.
 - The broad shutdown option therefore means "close all other windows"; reusable target windows survive.
 
 
-## v0.2.3 behaviour clarification
+## v0.2.4 behaviour clarification
 
 `Close all other windows` is the **enforce workflow** mode.
 

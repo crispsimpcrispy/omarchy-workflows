@@ -24,7 +24,9 @@ Panel {
   property string confirmWorkflowId: ""
   property string confirmWorkflowName: ""
   property string confirmShutdownMode: "current"
+  property int currentWorkspaceId: 1
   property int confirmWindowCount: 0
+  property string confirmAction: "workflow"
 
   property bool actionBusy: false
   property string statusMessage: ""
@@ -37,6 +39,7 @@ Panel {
   readonly property color borderColor: Color.popups.border
   readonly property color selectedBackground: Color.menu.selectedBackground
   readonly property color selectedText: Color.menu.selectedText
+  readonly property color accentBorder: Util.alpha(root.selectedBackground, 0.95)
   readonly property color mutedText: Util.alpha(root.foreground, 0.62)
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
   readonly property int cornerRadius: Style.cornerRadius
@@ -75,7 +78,15 @@ Panel {
     return false
   }
 
+  function refreshRuntime() {
+    if (!workspaceProc.running) {
+      workspaceProc.command = [root.backendPath, "active-workspace"]
+      workspaceProc.running = true
+    }
+  }
+
   function refreshConfig() {
+    root.refreshRuntime()
     if (configProc.running) return
     configProc.command = [root.backendPath, "config"]
     configProc.running = true
@@ -93,13 +104,22 @@ Panel {
     for (var i = 0; i < rows.length; ++i) {
       var w = rows[i] || ({})
       var sm = String(w.shutdownMode || (w.closeExisting === false ? "keep" : "all"))
+      var wsSeen = ({})
+      var wsList = []
+      var apps = w.apps || []
+      for (var j = 0; j < apps.length; ++j) {
+        var ws = String(apps[j].workspace || "")
+        if (ws && !wsSeen[ws]) { wsSeen[ws] = true; wsList.push(ws) }
+      }
+      wsList.sort(function(a, b) { return parseInt(a) - parseInt(b) })
       workflowModel.append({
         workflowId: String(w.id || ""),
         name: String(w.name || "Untitled"),
         icon: String(w.icon || "W"),
         shutdownMode: sm,
         startWorkspace: Number(w.startWorkspace || 1),
-        appCount: (w.apps || []).length,
+        appCount: apps.length,
+        workspaceSummary: wsList.join(","),
         isActive: String(root.configData.activeWorkflow || "") === String(w.id || ""),
         isStartup: String(root.configData.startupWorkflow || "") === String(w.id || "")
       })
@@ -199,6 +219,7 @@ Panel {
   }
 
   function requestLaunch(id, name, shutdownMode) {
+    root.confirmAction = "workflow"
     root.confirmWorkflowId = id
     root.confirmWorkflowName = name
     root.confirmShutdownMode = shutdownMode || "current"
@@ -209,6 +230,23 @@ Panel {
     if (countProc.running) return
     countProc.command = [root.backendPath, "count-close", id]
     countProc.running = true
+  }
+
+  function requestCloseAll() {
+    root.confirmAction = "close-all"
+    root.confirmWorkflowId = ""
+    root.confirmWorkflowName = ""
+    root.confirmShutdownMode = "all"
+    if (countProc.running) return
+    countProc.command = [root.backendPath, "count-windows"]
+    countProc.running = true
+  }
+
+  function closeAllNow() {
+    root.confirmOpen = false
+    root.statusError = false
+    root.pendingAction = "close-all"
+    root.runAction(["close-all-now"], "Closing all windows…")
   }
 
   function launchWorkflow(id, name) {
@@ -394,6 +432,17 @@ Panel {
   }
 
   Process {
+    id: workspaceProc
+    stdout: StdioCollector { id: workspaceOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        var ws = parseInt(String(workspaceOut.text || "1").trim())
+        if (!isNaN(ws) && ws > 0) root.currentWorkspaceId = ws
+      }
+    }
+  }
+
+  Process {
     id: configProc
     stdout: StdioCollector { id: configOut; waitForEnd: true }
     stderr: StdioCollector { id: configErr; waitForEnd: true }
@@ -426,8 +475,16 @@ Panel {
       var count = parseInt(String(countOut.text || "0").trim())
       if (isNaN(count)) count = 0
       root.confirmWindowCount = count
-      if (count > 0) root.confirmOpen = true
-      else root.launchWorkflow(root.confirmWorkflowId, root.confirmWorkflowName)
+      if (root.confirmAction === "close-all") {
+        if (count > 0) root.confirmOpen = true
+        else {
+          root.statusError = false
+          root.statusMessage = "No windows are open."
+        }
+      } else {
+        if (count > 0) root.confirmOpen = true
+        else root.launchWorkflow(root.confirmWorkflowId, root.confirmWorkflowName)
+      }
     }
   }
 
@@ -526,24 +583,38 @@ Panel {
           spacing: Style.space(8)
 
           Column {
-            width: parent.width - captureButton.width - addWorkflowButton.width - Style.space(16)
+            width: parent.width - closeAllButton.width - captureButton.width - addWorkflowButton.width - Style.space(24)
             spacing: Style.space(2)
             Text { text: "Workflows"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true }
             Text { text: "Switch your whole desktop setup in one click."; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
           }
 
           Rectangle {
+            id: closeAllButton
+            width: Style.space(88); height: Style.space(34); radius: Style.space(8)
+            color: closeAllMouse.containsMouse ? Util.alpha(root.bar.urgent, 0.24) : Util.alpha(root.bar.urgent, 0.10)
+            border.width: 1
+            border.color: Util.alpha(root.bar.urgent, 0.42)
+            Text { anchors.centerIn: parent; text: "Close All"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+            MouseArea { id: closeAllMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.requestCloseAll() }
+          }
+
+          Rectangle {
             id: captureButton
-            width: Style.space(104); height: Style.space(34); radius: Style.space(6)
+            width: Style.space(112); height: Style.space(34); radius: Style.space(8)
             color: captureMouse.containsMouse ? Util.alpha(root.foreground, 0.18) : Util.alpha(root.foreground, 0.08)
+            border.width: 1
+            border.color: Util.alpha(root.foreground, 0.12)
             Text { anchors.centerIn: parent; text: "Capture Desktop"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
             MouseArea { id: captureMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.captureDesktop() }
           }
 
           Rectangle {
             id: addWorkflowButton
-            width: Style.space(86); height: Style.space(34); radius: Style.space(6)
+            width: Style.space(86); height: Style.space(34); radius: Style.space(8)
             color: addWorkflowMouse.containsMouse ? Util.alpha(root.foreground, 0.18) : Util.alpha(root.foreground, 0.08)
+            border.width: 1
+            border.color: Util.alpha(root.foreground, 0.12)
             Text { anchors.centerIn: parent; text: "+ New"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
             MouseArea { id: addWorkflowMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.createWorkflow() }
           }
@@ -568,54 +639,119 @@ Panel {
             required property string shutdownMode
             required property int startWorkspace
             required property int appCount
+            required property string workspaceSummary
             required property bool isActive
             required property bool isStartup
 
             width: workflowList.width
-            height: Style.space(82)
-            radius: Style.space(7)
-            color: workflowRow.isActive ? Util.alpha(root.foreground, 0.10) : Util.alpha(root.foreground, 0.045)
+            height: Style.space(98)
+            radius: Style.space(10)
+            color: workflowRow.isActive ? Util.alpha(root.selectedBackground, 0.18) : Util.alpha(root.foreground, 0.04)
+            border.width: 1
+            border.color: workflowRow.isActive ? root.accentBorder : Util.alpha(root.foreground, 0.10)
+
+            Rectangle {
+              visible: workflowRow.isActive
+              anchors.left: parent.left
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              anchors.margins: Style.space(10)
+              width: Style.space(4)
+              radius: Style.space(2)
+              color: root.selectedBackground
+            }
 
             Row {
               anchors.fill: parent
-              anchors.margins: Style.space(8)
-              spacing: Style.space(9)
+              anchors.margins: Style.space(10)
+              spacing: Style.space(10)
 
               Rectangle {
-                width: Style.space(42); height: width; radius: Style.space(7)
+                width: Style.space(46); height: width; radius: Style.space(9)
                 anchors.verticalCenter: parent.verticalCenter
-                color: Util.alpha(root.foreground, 0.08)
+                color: workflowRow.isActive ? Util.alpha(root.selectedBackground, 0.22) : Util.alpha(root.foreground, 0.08)
+                border.width: 1
+                border.color: workflowRow.isActive ? Util.alpha(root.selectedBackground, 0.55) : Util.alpha(root.foreground, 0.12)
                 Text { anchors.centerIn: parent; text: workflowRow.icon; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true }
               }
 
               Column {
-                width: parent.width - Style.space(42) - editButton.width - launchButton.width - Style.space(35)
+                width: parent.width - Style.space(46) - editButton.width - launchButton.width - Style.space(40)
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(3)
+                spacing: Style.space(5)
                 Row {
-                  spacing: Style.space(7)
+                  spacing: Style.space(6)
                   Text { text: workflowRow.name; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body; font.bold: true }
-                  Text { visible: workflowRow.isActive; text: "ACTIVE"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                  Text { visible: workflowRow.isStartup; text: "LOGIN"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                  Rectangle {
+                    visible: workflowRow.isActive
+                    radius: Style.space(5)
+                    color: Util.alpha(root.selectedBackground, 0.22)
+                    border.width: 1
+                    border.color: Util.alpha(root.selectedBackground, 0.55)
+                    height: activeText.implicitHeight + Style.space(8)
+                    width: activeText.implicitWidth + Style.space(12)
+                    Text { id: activeText; anchors.centerIn: parent; text: "ACTIVE"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+                  }
+                  Rectangle {
+                    visible: workflowRow.isStartup
+                    radius: Style.space(5)
+                    color: Util.alpha(root.foreground, 0.08)
+                    border.width: 1
+                    border.color: Util.alpha(root.foreground, 0.14)
+                    height: loginText.implicitHeight + Style.space(8)
+                    width: loginText.implicitWidth + Style.space(12)
+                    Text { id: loginText; anchors.centerIn: parent; text: "LOGIN"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+                  }
                 }
                 Text {
                   text: workflowRow.appCount + " apps · " + root.shutdownLabel(workflowRow.shutdownMode) + " · starts on workspace " + workflowRow.startWorkspace
                   color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
                 }
+                Row {
+                  spacing: Style.space(5)
+                  visible: workflowRow.workspaceSummary.length > 0
+                  Repeater {
+                    model: workflowRow.workspaceSummary.length > 0 ? workflowRow.workspaceSummary.split(",") : []
+                    delegate: Rectangle {
+                      required property var modelData
+                      readonly property int wsValue: parseInt(modelData)
+                      readonly property bool isCurrent: workflowRow.isActive && wsValue === root.currentWorkspaceId
+                      height: workspaceChipText.implicitHeight + Style.space(8)
+                      width: workspaceChipText.implicitWidth + Style.space(14)
+                      radius: Style.space(5)
+                      color: isCurrent ? Util.alpha(root.selectedBackground, 0.28) : Util.alpha(root.foreground, 0.06)
+                      border.width: 1
+                      border.color: isCurrent ? Util.alpha(root.selectedBackground, 0.72) : Util.alpha(root.foreground, 0.12)
+                      Text {
+                        id: workspaceChipText
+                        anchors.centerIn: parent
+                        text: isCurrent ? ("WS " + wsValue + " • open") : ("WS " + wsValue)
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: isCurrent
+                      }
+                    }
+                  }
+                }
               }
 
               Rectangle {
                 id: editButton
-                width: Style.space(62); height: Style.space(32); radius: Style.space(5); anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(62); height: Style.space(34); radius: Style.space(7); anchors.verticalCenter: parent.verticalCenter
                 color: editMouse.containsMouse ? Util.alpha(root.foreground, 0.16) : Util.alpha(root.foreground, 0.07)
+                border.width: 1
+                border.color: Util.alpha(root.foreground, 0.12)
                 Text { anchors.centerIn: parent; text: "Edit"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
                 MouseArea { id: editMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.openEditor(workflowRow.workflowId) }
               }
 
               Rectangle {
                 id: launchButton
-                width: Style.space(70); height: Style.space(32); radius: Style.space(5); anchors.verticalCenter: parent.verticalCenter
-                color: launchMouse.containsMouse ? Util.alpha(root.foreground, 0.22) : Util.alpha(root.foreground, 0.10)
+                width: Style.space(76); height: Style.space(34); radius: Style.space(7); anchors.verticalCenter: parent.verticalCenter
+                color: launchMouse.containsMouse ? Util.alpha(root.selectedBackground, 0.26) : Util.alpha(root.selectedBackground, 0.14)
+                border.width: 1
+                border.color: Util.alpha(root.selectedBackground, 0.55)
                 Text { anchors.centerIn: parent; text: "Launch"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true }
                 MouseArea { id: launchMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.requestLaunch(workflowRow.workflowId, workflowRow.name, workflowRow.shutdownMode) }
               }
@@ -630,11 +766,21 @@ Panel {
           }
         }
 
-        Text {
+        Rectangle {
           width: parent.width
-          text: root.statusMessage || "Capture Desktop creates a workflow from the windows you have open right now."
-          color: root.statusError ? root.bar.urgent : root.mutedText
-          font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap
+          radius: Style.space(8)
+          color: Util.alpha(root.foreground, 0.035)
+          border.width: 1
+          border.color: Util.alpha(root.foreground, 0.10)
+          implicitHeight: statusText.implicitHeight + Style.space(18)
+          Text {
+            id: statusText
+            anchors.fill: parent
+            anchors.margins: Style.space(9)
+            text: root.statusMessage || "Capture Desktop creates a workflow from the windows you have open right now."
+            color: root.statusError ? root.bar.urgent : root.mutedText
+            font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap
+          }
         }
       }
 
@@ -924,12 +1070,14 @@ Panel {
           anchors.centerIn: parent
           spacing: Style.space(12)
 
-          Text { width: parent.width; text: "Switch to " + root.confirmWorkflowName + "?"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true; horizontalAlignment: Text.AlignHCenter }
+          Text { width: parent.width; text: root.confirmAction === "close-all" ? "Close every open window?" : ("Switch to " + root.confirmWorkflowName + "?"); color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true; horizontalAlignment: Text.AlignHCenter }
           Text {
             width: parent.width
-            text: root.confirmShutdownMode === "all"
-              ? "This will send a normal close request to " + root.confirmWindowCount + " currently open window" + (root.confirmWindowCount === 1 ? "" : "s") + ". Unsaved apps may ask you to save."
-              : "This will close " + root.confirmWindowCount + " window" + (root.confirmWindowCount === 1 ? "" : "s") + " from the currently active workflow. Applications marked Reuse existing in the new workflow are kept and moved instead."
+            text: root.confirmAction === "close-all"
+              ? "This will send a normal close request to " + root.confirmWindowCount + " currently open window" + (root.confirmWindowCount === 1 ? "" : "s") + ". Unsaved apps may ask you to save before closing."
+              : (root.confirmShutdownMode === "all"
+                ? "This will close " + root.confirmWindowCount + " window" + (root.confirmWindowCount === 1 ? "" : "s") + " that are not part of the target workflow. Reusable workflow apps stay open and are moved into place."
+                : "This will close " + root.confirmWindowCount + " window" + (root.confirmWindowCount === 1 ? "" : "s") + " from the currently active workflow. Applications marked Reuse existing in the new workflow are kept and moved instead.")
             color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap; horizontalAlignment: Text.AlignHCenter
           }
           Row {
@@ -941,8 +1089,8 @@ Panel {
             }
             Rectangle {
               width: Style.space(122); height: Style.space(36); radius: Style.space(6); color: switchMouse.containsMouse ? Util.alpha(root.foreground, 0.24) : Util.alpha(root.foreground, 0.12)
-              Text { anchors.centerIn: parent; text: "Switch"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true }
-              MouseArea { id: switchMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.launchWorkflow(root.confirmWorkflowId, root.confirmWorkflowName) }
+              Text { anchors.centerIn: parent; text: root.confirmAction === "close-all" ? "Close everything" : "Switch"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true }
+              MouseArea { id: switchMouse; anchors.fill: parent; hoverEnabled: true; onClicked: { if (root.confirmAction === "close-all") root.closeAllNow(); else root.launchWorkflow(root.confirmWorkflowId, root.confirmWorkflowName) } }
             }
           }
         }

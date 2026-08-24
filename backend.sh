@@ -488,12 +488,27 @@ run_workflow() {
   fi
 }
 
+active_workspace() {
+  require_cmd hyprctl
+  require_cmd jq
+  hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // 1' 2>/dev/null || echo 1
+}
+
+close_all_now() {
+  require_cmd hyprctl
+  require_cmd jq
+  close_all_windows '[]'
+  atomic_jq '.activeWorkflow=""'
+  printf 'Closed all windows.
+'
+}
+
 capture_windows() {
   require_cmd hyprctl
   require_cmd jq
   local clients active_ws
   clients="$(clients_json)"
-  active_ws="$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // 1' 2>/dev/null || echo 1)"
+  active_ws="$(active_workspace)"
   jq -n --argjson activeWorkspace "$active_ws" --argjson clients "$clients" '{
     activeWorkspace: $activeWorkspace,
     windows: [
@@ -592,10 +607,12 @@ case "${1:-config}" in
   count-windows) count_windows ;;
   count-close) shift; count_close_for_target "$@" ;;
   capture) capture_windows ;;
+  active-workspace) active_workspace ;;
+  close-all-now) close_all_now ;;
   run) shift; run_workflow "$@" ;;
   set-startup) shift; set_startup "$@" ;;
   run-startup) run_startup ;;
   sync-startup) sync_startup_hook ;;
   diagnose) diagnose ;;
-  *) fail "Usage: $0 {config|current|add-workflow|create-workflow-json|replace-workflow|delete-workflow|count-windows|count-close|capture|run|set-startup|run-startup|sync-startup|diagnose}" ;;
+  *) fail "Usage: $0 {config|current|add-workflow|create-workflow-json|replace-workflow|delete-workflow|count-windows|count-close|capture|active-workspace|close-all-now|run|set-startup|run-startup|sync-startup|diagnose}" ;;
 esac
