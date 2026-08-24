@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 printf 'Checking manifest JSON... '
-jq -e '.schemaVersion==1 and .id=="io.github.crispsimpcrispy.workflows" and .version=="0.2.2" and (.kinds|index("bar-widget")!=null) and .entryPoints.barWidget=="BarWidget.qml"' manifest.json >/dev/null
+jq -e '.schemaVersion==1 and .id=="io.github.crispsimpcrispy.workflows" and .version=="0.2.3" and (.kinds|index("bar-widget")!=null) and .entryPoints.barWidget=="BarWidget.qml"' manifest.json >/dev/null
 printf 'OK\n'
 
 printf 'Checking backend shell syntax... '
@@ -89,16 +89,19 @@ if grep -q 'close.*address:0x3' "$log"; then echo 'Unrelated terminal should not
 grep -q 'address:0x1' "$log" || { echo 'Expected Browser to be moved/reused'; exit 1; }
 printf '  current-workflow close + reuse: OK\n'
 
-# Re-selecting the already-active Work workflow must be idempotent: no close
-# requests, no browser/Spotify relaunch, but existing windows are moved as needed.
+# Re-selecting the already-active Work workflow in "all" mode enforces the
+# target workflow: reusable Work windows survive, unrelated windows close, and
+# target apps are moved/reused rather than relaunched.
 jq '.activeWorkflow="work" | (.workflows[]|select(.id=="work")|.shutdownMode)="all"' "$XDG_CONFIG_HOME/omarchy/workflows/workflows.json" >"$tmp/config.new"
 mv "$tmp/config.new" "$XDG_CONFIG_HOME/omarchy/workflows/workflows.json"
 : >"$log"
 ./backend.sh run work >/dev/null
-if grep -q 'close.*address:' "$log"; then echo 'Same workflow must not close any windows'; exit 1; fi
+if grep -q 'close.*address:0x1' "$log"; then echo 'Same-workflow Browser should be preserved'; exit 1; fi
+if grep -q 'close.*address:0x2' "$log"; then echo 'Same-workflow Spotify should be preserved'; exit 1; fi
+grep -q 'close.*address:0x3' "$log" || { echo 'Unrelated terminal should close when enforcing Work'; exit 1; }
 if grep -q 'exec_cmd.*omarchy-launch-browser\|\[workspace 1 silent\].*omarchy-launch-browser' "$log"; then echo 'Same workflow should reuse Browser, not relaunch it'; exit 1; fi
 if grep -q 'exec_cmd.*omarchy-launch-spotify\|\[workspace 4 silent\].*omarchy-launch-spotify' "$log"; then echo 'Same workflow should reuse Spotify, not relaunch it'; exit 1; fi
-printf '  same-workflow reconcile: OK\n'
+printf '  same-workflow enforce + reuse: OK\n'
 
 # Broad close mode closes all *other* windows, but target apps marked reusable
 # survive. Research targets Zotero only, so current Browser/Spotify/Terminal close

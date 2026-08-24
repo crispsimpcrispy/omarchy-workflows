@@ -370,10 +370,19 @@ count_close_for_target() {
   apps="$(jq -c '.apps // []' <<<"$workflow")"
   active_id="$(jq -r '.activeWorkflow // ""' "$CONFIG_FILE")"
 
-  # Re-selecting the workflow that is already active is a reconcile operation,
-  # never a teardown/relaunch operation.
+  # Re-selecting the active workflow is a reconcile operation.  "keep" and
+  # "current" do not tear it down, but "all" is an enforce-workflow mode:
+  # reusable target windows are protected and every other open window closes.
   if [[ "$active_id" == "$id" ]]; then
-    echo 0
+    case "$mode" in
+      keep|current) echo 0 ;;
+      all)
+        all_count="$(count_windows)"
+        protected="$(reusable_target_addresses "$apps")"
+        protected_count="$(grep -cve '^$' <<<"$protected" || true)"
+        (( all_count > protected_count )) && echo $((all_count - protected_count)) || echo 0
+        ;;
+    esac
     return 0
   fi
 
@@ -429,10 +438,15 @@ run_workflow() {
   active_id="$(jq -r '.activeWorkflow // ""' "$CONFIG_FILE")"
   [[ "$active_id" == "$id" ]] && same_workflow=true
 
-  # Selecting the workflow that is already active means "put this workflow
-  # back where it belongs".  Do not close anything first, regardless of its
-  # configured switch shutdown mode.
-  if [[ "$same_workflow" != "true" ]]; then
+  # Selecting the workflow that is already active normally means "put this
+  # workflow back where it belongs".  In broad/enforce mode, however, also
+  # close windows that are not reusable members of the target workflow.
+  if [[ "$same_workflow" == "true" ]]; then
+    case "$mode" in
+      all) close_all_windows "$apps"; sleep 0.5 ;;
+      current|keep) : ;;
+    esac
+  else
     case "$mode" in
       all) close_all_windows "$apps"; sleep 1 ;;
       current) close_current_workflow_windows "$apps"; sleep 1 ;;
