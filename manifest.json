@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.crispsimpcrispy.workflows",
+  "name": "Workflows",
+  "version": "0.1.0",
+  "author": "crispsimpcrispy",
+  "license": "MIT",
+  "description": "Switch between reusable Omarchy desktop workflows from the top bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Workflows",
+    "description": "Launch groups of apps into assigned Hyprland workspaces",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
