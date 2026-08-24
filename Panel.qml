@@ -14,12 +14,18 @@ Panel {
   readonly property string backendPath: Quickshell.env("HOME") + "/.config/omarchy/plugins/io.github.crispsimpcrispy.workflows/backend.sh"
 
   property var configData: ({ workflows: [], activeWorkflow: "", startupWorkflow: "" })
-  property string mode: "list"
+  property string mode: "list" // list | edit | picker
   property string selectedWorkflowId: ""
+  property string shutdownModeValue: "current"
+  property int pickerReplaceIndex: -1
+  property string pickerQuery: ""
+
   property bool confirmOpen: false
   property string confirmWorkflowId: ""
   property string confirmWorkflowName: ""
+  property string confirmShutdownMode: "current"
   property int confirmWindowCount: 0
+
   property bool actionBusy: false
   property string statusMessage: ""
   property bool statusError: false
@@ -37,6 +43,10 @@ Panel {
 
   function parseJson(text, fallback) {
     try { return JSON.parse(String(text || "")) } catch (e) { return fallback }
+  }
+
+  function regexEscape(value) {
+    return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
   }
 
   function open(payloadJson) {
@@ -57,9 +67,7 @@ Panel {
     else root.open(payloadJson || "{}")
   }
 
-  function closeForPopoutSwitch() {
-    root.controller.hide()
-  }
+  function closeForPopoutSwitch() { root.controller.hide() }
 
   function switchPanel(direction) {
     if (root.bar && typeof root.bar.switchPanelFrom === "function")
@@ -73,16 +81,23 @@ Panel {
     configProc.running = true
   }
 
+  function shutdownLabel(mode) {
+    if (mode === "all") return "Close all windows"
+    if (mode === "keep") return "Keep everything"
+    return "Close current workflow"
+  }
+
   function rebuildWorkflowModel() {
     workflowModel.clear()
     var rows = root.configData.workflows || []
     for (var i = 0; i < rows.length; ++i) {
       var w = rows[i] || ({})
+      var sm = String(w.shutdownMode || (w.closeExisting === false ? "keep" : "all"))
       workflowModel.append({
         workflowId: String(w.id || ""),
         name: String(w.name || "Untitled"),
         icon: String(w.icon || "W"),
-        closeExisting: w.closeExisting !== false,
+        shutdownMode: sm,
         startWorkspace: Number(w.startWorkspace || 1),
         appCount: (w.apps || []).length,
         isActive: String(root.configData.activeWorkflow || "") === String(w.id || ""),
@@ -105,7 +120,7 @@ Panel {
     nameInput.text = String(w.name || "")
     iconInput.text = String(w.icon || "W")
     workspaceInput.text = String(w.startWorkspace || 1)
-    closeToggle.checked = w.closeExisting !== false
+    root.shutdownModeValue = String(w.shutdownMode || (w.closeExisting === false ? "keep" : "all"))
     appEditModel.clear()
     var apps = w.apps || []
     for (var i = 0; i < apps.length; ++i) {
@@ -113,8 +128,11 @@ Panel {
       appEditModel.append({
         appName: String(a.name || "Application"),
         workspace: String(a.workspace || 1),
+        desktopId: String(a.desktopId || ""),
         command: String(a.command || ""),
-        match: String(a.match || "")
+        match: String(a.match || ""),
+        reuseExisting: a.reuseExisting !== false,
+        icon: String(a.icon || "")
       })
     }
     root.mode = "edit"
@@ -124,6 +142,18 @@ Panel {
   function createWorkflow() {
     root.pendingAction = "open-new"
     root.runAction(["add-workflow", "New Workflow", "W"], "Creating workflow…")
+  }
+
+  function appObject(row) {
+    return {
+      name: String(row.appName || "Application"),
+      workspace: Number(row.workspace || 1),
+      desktopId: String(row.desktopId || ""),
+      command: String(row.command || ""),
+      match: String(row.match || ""),
+      reuseExisting: row.reuseExisting !== false,
+      icon: String(row.icon || "")
+    }
   }
 
   function saveWorkflow() {
@@ -148,24 +178,19 @@ Panel {
         root.statusMessage = "Every application needs a workspace of 1 or higher."
         return
       }
-      if (!String(row.command || "").trim()) {
+      if (!String(row.desktopId || "").trim() && !String(row.command || "").trim()) {
         root.statusError = true
-        root.statusMessage = "Every application needs a launch command."
+        root.statusMessage = "Every application needs a desktop entry or custom launch command."
         return
       }
-      apps.push({
-        name: String(row.appName || "Application"),
-        workspace: ws,
-        command: String(row.command || ""),
-        match: String(row.match || "")
-      })
+      apps.push(root.appObject(row))
     }
 
     var workflow = {
       id: root.selectedWorkflowId,
       name: nameInput.text.trim(),
       icon: iconInput.text.trim() || "W",
-      closeExisting: closeToggle.checked,
+      shutdownMode: root.shutdownModeValue,
       startWorkspace: startWs,
       apps: apps
     }
@@ -173,15 +198,16 @@ Panel {
     root.runAction(["replace-workflow", root.selectedWorkflowId, JSON.stringify(workflow)], "Saving workflow…")
   }
 
-  function requestLaunch(id, name, closeExisting) {
+  function requestLaunch(id, name, shutdownMode) {
     root.confirmWorkflowId = id
     root.confirmWorkflowName = name
-    if (!closeExisting) {
+    root.confirmShutdownMode = shutdownMode || "current"
+    if (root.confirmShutdownMode === "keep") {
       root.launchWorkflow(id, name)
       return
     }
     if (countProc.running) return
-    countProc.command = [root.backendPath, "count-windows"]
+    countProc.command = [root.backendPath, "count-close", id]
     countProc.running = true
   }
 
@@ -215,8 +241,157 @@ Panel {
     root.runAction(["delete-workflow", root.selectedWorkflowId], "Deleting workflow…")
   }
 
+  function openPicker(replaceIndex) {
+    root.pickerReplaceIndex = replaceIndex === undefined ? -1 : replaceIndex
+    root.pickerQuery = ""
+    pickerSearch.text = ""
+    root.mode = "picker"
+    Qt.callLater(function() { pickerSearch.forceActiveFocus() })
+  }
+
+  function matcherForEntry(entry) {
+    var parts = []
+    if (entry && entry.startupClass) parts.push(root.regexEscape(entry.startupClass))
+    if (entry && entry.id) parts.push(root.regexEscape(entry.id))
+    if (entry && entry.name) parts.push(root.regexEscape(entry.name))
+    var unique = []
+    var seen = ({})
+    for (var i = 0; i < parts.length; ++i) {
+      var key = parts[i].toLowerCase()
+      if (!seen[key]) { seen[key] = true; unique.push(parts[i]) }
+    }
+    return unique.join("|")
+  }
+
+  function chooseDesktopEntry(entry) {
+    if (!entry) return
+    var row = {
+      appName: String(entry.name || entry.id || "Application"),
+      workspace: "1",
+      desktopId: String(entry.id || ""),
+      command: "",
+      match: root.matcherForEntry(entry),
+      reuseExisting: true,
+      icon: String(entry.icon || "")
+    }
+    if (root.pickerReplaceIndex >= 0 && root.pickerReplaceIndex < appEditModel.count) {
+      var old = appEditModel.get(root.pickerReplaceIndex)
+      row.workspace = String(old.workspace || "1")
+      appEditModel.set(root.pickerReplaceIndex, row)
+    } else {
+      appEditModel.append(row)
+    }
+    root.mode = "edit"
+    root.statusError = false
+    root.statusMessage = "Added " + row.appName + " from its desktop entry."
+  }
+
+  function addCustomApp() {
+    appEditModel.append({
+      appName: "Custom command",
+      workspace: "1",
+      desktopId: "",
+      command: "",
+      match: "",
+      reuseExisting: true,
+      icon: ""
+    })
+    root.mode = "edit"
+  }
+
+  function entryForWindow(win) {
+    var candidates = [win.initialClass, win.class, win.initialTitle, win.title]
+    for (var i = 0; i < candidates.length; ++i) {
+      var value = String(candidates[i] || "").trim()
+      if (!value) continue
+      var entry = DesktopEntries.heuristicLookup(value)
+      if (entry) return entry
+    }
+    return null
+  }
+
+  function captureDesktop() {
+    if (captureProc.running || actionProc.running) return
+    root.statusError = false
+    root.statusMessage = "Capturing current desktop…"
+    captureProc.command = [root.backendPath, "capture"]
+    captureProc.running = true
+  }
+
+  function buildCapturedWorkflow(data) {
+    var windows = data.windows || data || []
+    var apps = []
+    var seen = ({})
+    var unmatched = 0
+
+    for (var i = 0; i < windows.length; ++i) {
+      var win = windows[i] || ({})
+      var cls = String(win.initialClass || win.class || "").trim()
+      var entry = root.entryForWindow(win)
+      var desktopId = entry ? String(entry.id || "") : ""
+      var identity = (desktopId ? "desktop:" + desktopId : "class:" + cls).toLowerCase()
+      if (!identity || seen[identity]) continue
+      seen[identity] = true
+
+      var displayName = entry ? String(entry.name || desktopId) : String(win.title || cls || "Application")
+      var matcher = entry ? root.matcherForEntry(entry) : root.regexEscape(cls || displayName)
+      var command = ""
+      if (!desktopId) {
+        // Best effort for unusual apps without a desktop entry. The editor opens
+        // immediately after capture so this can be corrected before first use.
+        command = cls
+        unmatched++
+      }
+
+      apps.push({
+        name: displayName,
+        workspace: Number(win.workspace || 1),
+        desktopId: desktopId,
+        command: command,
+        match: matcher,
+        reuseExisting: true,
+        icon: entry ? String(entry.icon || "") : ""
+      })
+    }
+
+    var workflow = {
+      name: "Captured Desktop",
+      icon: "C",
+      shutdownMode: "current",
+      startWorkspace: Number(data.activeWorkspace || 1),
+      apps: apps
+    }
+
+    root.pendingAction = "captured"
+    root.statusMessage = unmatched > 0
+      ? "Captured desktop; " + unmatched + " app" + (unmatched === 1 ? " needs" : "s need") + " its command checked."
+      : "Captured desktop."
+    root.runAction(["create-workflow-json", JSON.stringify(workflow)], root.statusMessage)
+  }
+
+  function appIconSource(iconName) {
+    if (!iconName) return ""
+    return Quickshell.iconPath(iconName, true)
+  }
+
   ListModel { id: workflowModel }
   ListModel { id: appEditModel }
+
+  ScriptModel {
+    id: pickerModel
+    values: [...DesktopEntries.applications.values]
+      .filter(function(entry) {
+        var query = root.pickerQuery.trim().toLowerCase()
+        if (!query) return true
+        var hay = [entry.name, entry.id, entry.genericName, entry.comment, entry.startupClass]
+          .join(" ").toLowerCase()
+        var terms = query.split(/\s+/)
+        for (var i = 0; i < terms.length; ++i)
+          if (terms[i] && hay.indexOf(terms[i]) < 0) return false
+        return true
+      })
+      .sort(function(a, b) { return String(a.name).localeCompare(String(b.name)) })
+  }
 
   Process {
     id: configProc
@@ -241,12 +416,33 @@ Panel {
   Process {
     id: countProc
     stdout: StdioCollector { id: countOut; waitForEnd: true }
+    stderr: StdioCollector { id: countErr; waitForEnd: true }
     onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.statusError = true
+        root.statusMessage = String(countErr.text || "Could not inspect open windows.").trim()
+        return
+      }
       var count = parseInt(String(countOut.text || "0").trim())
       if (isNaN(count)) count = 0
       root.confirmWindowCount = count
       if (count > 0) root.confirmOpen = true
       else root.launchWorkflow(root.confirmWorkflowId, root.confirmWorkflowName)
+    }
+  }
+
+  Process {
+    id: captureProc
+    stdout: StdioCollector { id: captureOut; waitForEnd: true }
+    stderr: StdioCollector { id: captureErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.statusError = true
+        root.statusMessage = String(captureErr.text || "Could not capture desktop.").trim()
+        return
+      }
+      var data = root.parseJson(captureOut.text, { windows: [] })
+      root.buildCapturedWorkflow(data)
     }
   }
 
@@ -268,14 +464,13 @@ Panel {
       if (exitCode !== 0) {
         root.statusError = true
         root.statusMessage = String(actionErr.text || "Action failed.").trim()
+        root.pendingAction = ""
         return
       }
 
       var out = String(actionOut.text || "").trim()
       root.statusError = false
-      root.statusMessage = out || "Done."
-
-      if (root.pendingAction === "open-new") {
+      if (root.pendingAction === "open-new" || root.pendingAction === "captured") {
         var result = root.parseJson(out, {})
         if (result.id) {
           root.selectedWorkflowId = String(result.id)
@@ -283,13 +478,16 @@ Panel {
         }
         root.refreshConfig()
       } else if (root.pendingAction === "saved") {
+        root.statusMessage = out || "Saved."
         root.mode = "list"
         root.refreshConfig()
       } else if (root.pendingAction === "deleted") {
+        root.statusMessage = out || "Deleted."
         root.mode = "list"
         root.selectedWorkflowId = ""
         root.refreshConfig()
       } else {
+        root.statusMessage = out || "Done."
         root.refreshConfig()
       }
       root.pendingAction = ""
@@ -304,13 +502,17 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
 
-    contentWidth: panel.fittedContentWidth(Style.space(760))
-    contentHeight: panel.fittedContentHeight(root.mode === "edit" ? Style.space(650) : Style.space(560))
+    contentWidth: panel.fittedContentWidth(Style.space(800))
+    contentHeight: panel.fittedContentHeight(root.mode === "edit" ? Style.space(720) : Style.space(600))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onCloseRequested: root.close()
+      onCloseRequested: {
+        if (root.mode === "picker") root.mode = "edit"
+        else if (root.mode === "edit") root.mode = "list"
+        else root.close()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       Column {
@@ -324,30 +526,25 @@ Panel {
           spacing: Style.space(8)
 
           Column {
-            width: parent.width - addWorkflowButton.width - Style.space(8)
+            width: parent.width - captureButton.width - addWorkflowButton.width - Style.space(16)
             spacing: Style.space(2)
-            Text {
-              text: "Workflows"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.subtitle
-              font.bold: true
-            }
-            Text {
-              text: "Close the current desktop and build a new workspace layout."
-              color: root.mutedText
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-            }
+            Text { text: "Workflows"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true }
+            Text { text: "Switch your whole desktop setup in one click."; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+          }
+
+          Rectangle {
+            id: captureButton
+            width: Style.space(104); height: Style.space(34); radius: Style.space(6)
+            color: captureMouse.containsMouse ? Util.alpha(root.foreground, 0.18) : Util.alpha(root.foreground, 0.08)
+            Text { anchors.centerIn: parent; text: "Capture Desktop"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+            MouseArea { id: captureMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.captureDesktop() }
           }
 
           Rectangle {
             id: addWorkflowButton
-            width: Style.space(112)
-            height: Style.space(34)
-            radius: Style.space(6)
-            color: addWorkflowMouse.containsMouse ? Util.alpha(root.foreground, 0.17) : Util.alpha(root.foreground, 0.08)
-            Text { anchors.centerIn: parent; text: "+ Workflow"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true }
+            width: Style.space(86); height: Style.space(34); radius: Style.space(6)
+            color: addWorkflowMouse.containsMouse ? Util.alpha(root.foreground, 0.18) : Util.alpha(root.foreground, 0.08)
+            Text { anchors.centerIn: parent; text: "+ New"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
             MouseArea { id: addWorkflowMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.createWorkflow() }
           }
         }
@@ -357,9 +554,9 @@ Panel {
         ListView {
           id: workflowList
           width: parent.width
-          height: Style.space(410)
+          height: Style.space(455)
           clip: true
-          spacing: Style.space(8)
+          spacing: Style.space(7)
           model: workflowModel
 
           delegate: Rectangle {
@@ -368,7 +565,7 @@ Panel {
             required property string workflowId
             required property string name
             required property string icon
-            required property bool closeExisting
+            required property string shutdownMode
             required property int startWorkspace
             required property int appCount
             required property bool isActive
@@ -376,34 +573,23 @@ Panel {
 
             width: workflowList.width
             height: Style.space(82)
-            radius: Style.space(8)
-            color: rowMouse.containsMouse ? Util.alpha(root.foreground, 0.075) : Util.alpha(root.foreground, 0.035)
-            border.width: isActive ? 1 : 0
-            border.color: isActive ? Util.alpha(root.foreground, 0.32) : "transparent"
-
-            MouseArea { id: rowMouse; anchors.fill: parent; hoverEnabled: true }
+            radius: Style.space(7)
+            color: workflowRow.isActive ? Util.alpha(root.foreground, 0.10) : Util.alpha(root.foreground, 0.045)
 
             Row {
               anchors.fill: parent
-              anchors.margins: Style.space(10)
-              spacing: Style.space(10)
+              anchors.margins: Style.space(8)
+              spacing: Style.space(9)
 
               Rectangle {
-                width: Style.space(48); height: width; radius: Style.space(8)
+                width: Style.space(42); height: width; radius: Style.space(7)
                 anchors.verticalCenter: parent.verticalCenter
                 color: Util.alpha(root.foreground, 0.08)
-                Text {
-                  anchors.centerIn: parent
-                  text: workflowRow.icon
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  font.bold: true
-                }
+                Text { anchors.centerIn: parent; text: workflowRow.icon; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true }
               }
 
               Column {
-                width: parent.width - Style.space(48) - launchButton.width - editButton.width - Style.space(40)
+                width: parent.width - Style.space(42) - editButton.width - launchButton.width - Style.space(35)
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(3)
                 Row {
@@ -413,17 +599,14 @@ Panel {
                   Text { visible: workflowRow.isStartup; text: "LOGIN"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                 }
                 Text {
-                  text: workflowRow.appCount + " apps · starts on workspace " + workflowRow.startWorkspace + (workflowRow.closeExisting ? " · closes current windows" : " · keeps current windows")
-                  color: root.mutedText
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
+                  text: workflowRow.appCount + " apps · " + root.shutdownLabel(workflowRow.shutdownMode) + " · starts on workspace " + workflowRow.startWorkspace
+                  color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
                 }
               }
 
               Rectangle {
                 id: editButton
-                width: Style.space(62); height: Style.space(34); radius: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(62); height: Style.space(32); radius: Style.space(5); anchors.verticalCenter: parent.verticalCenter
                 color: editMouse.containsMouse ? Util.alpha(root.foreground, 0.16) : Util.alpha(root.foreground, 0.07)
                 Text { anchors.centerIn: parent; text: "Edit"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
                 MouseArea { id: editMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.openEditor(workflowRow.workflowId) }
@@ -431,27 +614,27 @@ Panel {
 
               Rectangle {
                 id: launchButton
-                width: Style.space(78); height: Style.space(34); radius: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                color: launchMouse.containsMouse ? Util.alpha(root.foreground, 0.22) : Util.alpha(root.foreground, 0.11)
+                width: Style.space(70); height: Style.space(32); radius: Style.space(5); anchors.verticalCenter: parent.verticalCenter
+                color: launchMouse.containsMouse ? Util.alpha(root.foreground, 0.22) : Util.alpha(root.foreground, 0.10)
                 Text { anchors.centerIn: parent; text: "Launch"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true }
-                MouseArea {
-                  id: launchMouse; anchors.fill: parent; hoverEnabled: true
-                  onClicked: root.requestLaunch(workflowRow.workflowId, workflowRow.name, workflowRow.closeExisting)
-                }
+                MouseArea { id: launchMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.requestLaunch(workflowRow.workflowId, workflowRow.name, workflowRow.shutdownMode) }
               }
             }
           }
+
+          Text {
+            anchors.centerIn: parent
+            visible: workflowModel.count === 0
+            text: "No workflows yet. Capture your desktop or create one."
+            color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
+          }
         }
 
-        Rectangle { width: parent.width; height: 1; color: Util.alpha(root.foreground, 0.12) }
         Text {
           width: parent.width
-          text: root.statusMessage || "Tip: window class matchers make Chromium/Electron apps land reliably on the requested workspace."
+          text: root.statusMessage || "Capture Desktop creates a workflow from the windows you have open right now."
           color: root.statusError ? root.bar.urgent : root.mutedText
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          wrapMode: Text.WordWrap
+          font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap
         }
       }
 
@@ -462,82 +645,81 @@ Panel {
         visible: root.mode === "edit"
 
         Row {
-          width: parent.width
-          spacing: Style.space(8)
+          width: parent.width; spacing: Style.space(8)
           Rectangle {
-            width: Style.space(70); height: Style.space(34); radius: Style.space(6)
-            color: backMouse.containsMouse ? Util.alpha(root.foreground, 0.16) : Util.alpha(root.foreground, 0.07)
+            width: Style.space(64); height: Style.space(32); radius: Style.space(5)
+            color: backEditMouse.containsMouse ? Util.alpha(root.foreground, 0.16) : Util.alpha(root.foreground, 0.07)
             Text { anchors.centerIn: parent; text: "← Back"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
-            MouseArea { id: backMouse; anchors.fill: parent; hoverEnabled: true; onClicked: { root.mode = "list"; root.refreshConfig() } }
+            MouseArea { id: backEditMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.mode = "list" }
           }
-          Text {
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Edit Workflow"
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.subtitle
-            font.bold: true
-          }
+          Text { anchors.verticalCenter: parent.verticalCenter; text: "Edit Workflow"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true }
         }
 
         Row {
-          width: parent.width
-          spacing: Style.space(8)
-          Column {
-            width: Style.space(80); spacing: Style.space(3)
-            Text { text: "Icon"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-            Rectangle {
-              width: parent.width; height: Style.space(34); radius: Style.space(5); color: Util.alpha(root.foreground, 0.07)
-              TextInput { id: iconInput; anchors.fill: parent; anchors.margins: Style.space(7); color: root.foreground; font.family: root.fontFamily; verticalAlignment: TextInput.AlignVCenter; selectByMouse: true }
-            }
-          }
-          Column {
-            width: parent.width - Style.space(80) - Style.space(120) - Style.space(16); spacing: Style.space(3)
+          width: parent.width; spacing: Style.space(8)
+          Column { width: Style.space(390); spacing: Style.space(3)
             Text { text: "Name"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-            Rectangle {
-              width: parent.width; height: Style.space(34); radius: Style.space(5); color: Util.alpha(root.foreground, 0.07)
-              TextInput { id: nameInput; anchors.fill: parent; anchors.margins: Style.space(7); color: root.foreground; font.family: root.fontFamily; verticalAlignment: TextInput.AlignVCenter; selectByMouse: true }
+            Rectangle { width: parent.width; height: Style.space(34); radius: Style.space(5); color: Util.alpha(root.foreground, 0.07)
+              TextInput { id: nameInput; anchors.fill: parent; anchors.margins: Style.space(6); color: root.foreground; font.family: root.fontFamily; verticalAlignment: TextInput.AlignVCenter; selectByMouse: true }
             }
           }
-          Column {
-            width: Style.space(120); spacing: Style.space(3)
-            Text { text: "Start workspace"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-            Rectangle {
-              width: parent.width; height: Style.space(34); radius: Style.space(5); color: Util.alpha(root.foreground, 0.07)
-              TextInput { id: workspaceInput; anchors.fill: parent; anchors.margins: Style.space(7); color: root.foreground; font.family: root.fontFamily; verticalAlignment: TextInput.AlignVCenter; horizontalAlignment: TextInput.AlignHCenter; inputMethodHints: Qt.ImhDigitsOnly; selectByMouse: true }
+          Column { width: Style.space(70); spacing: Style.space(3)
+            Text { text: "Icon"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+            Rectangle { width: parent.width; height: Style.space(34); radius: Style.space(5); color: Util.alpha(root.foreground, 0.07)
+              TextInput { id: iconInput; anchors.fill: parent; anchors.margins: Style.space(6); color: root.foreground; font.family: root.fontFamily; horizontalAlignment: TextInput.AlignHCenter; verticalAlignment: TextInput.AlignVCenter; selectByMouse: true }
+            }
+          }
+          Column { width: Style.space(92); spacing: Style.space(3)
+            Text { text: "Start WS"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+            Rectangle { width: parent.width; height: Style.space(34); radius: Style.space(5); color: Util.alpha(root.foreground, 0.07)
+              TextInput { id: workspaceInput; anchors.fill: parent; anchors.margins: Style.space(6); color: root.foreground; font.family: root.fontFamily; horizontalAlignment: TextInput.AlignHCenter; verticalAlignment: TextInput.AlignVCenter; inputMethodHints: Qt.ImhDigitsOnly; selectByMouse: true }
+            }
+          }
+        }
+
+        Text { text: "When switching to this workflow"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+        Row {
+          width: parent.width; spacing: Style.space(7)
+          Repeater {
+            model: [
+              { value: "current", label: "Close current workflow" },
+              { value: "keep", label: "Keep existing windows" },
+              { value: "all", label: "Close all windows" }
+            ]
+            delegate: Rectangle {
+              required property var modelData
+              width: Style.space(180); height: Style.space(34); radius: Style.space(6)
+              color: root.shutdownModeValue === modelData.value ? Util.alpha(root.foreground, 0.18) : Util.alpha(root.foreground, 0.06)
+              border.width: root.shutdownModeValue === modelData.value ? 1 : 0
+              border.color: Util.alpha(root.foreground, 0.28)
+              Text { anchors.centerIn: parent; text: modelData.label; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+              MouseArea { anchors.fill: parent; onClicked: root.shutdownModeValue = modelData.value }
             }
           }
         }
 
         Row {
-          spacing: Style.space(8)
+          width: parent.width; spacing: Style.space(8)
+          Text { anchors.verticalCenter: parent.verticalCenter; text: "Applications"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body; font.bold: true }
+          Item { width: parent.width - Style.space(330); height: 1 }
           Rectangle {
-            id: closeToggle
-            property bool checked: true
-            width: Style.space(42); height: Style.space(24); radius: height / 2
-            color: checked ? Util.alpha(root.foreground, 0.30) : Util.alpha(root.foreground, 0.09)
-            Rectangle { width: Style.space(16); height: width; radius: width/2; anchors.verticalCenter: parent.verticalCenter; x: closeToggle.checked ? parent.width - width - Style.space(4) : Style.space(4); color: root.foreground }
-            MouseArea { anchors.fill: parent; onClicked: closeToggle.checked = !closeToggle.checked }
+            width: Style.space(104); height: Style.space(30); radius: Style.space(5)
+            color: customMouse.containsMouse ? Util.alpha(root.foreground, 0.16) : Util.alpha(root.foreground, 0.07)
+            Text { anchors.centerIn: parent; text: "+ Custom"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+            MouseArea { id: customMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.addCustomApp() }
           }
-          Text { anchors.verticalCenter: closeToggle.verticalCenter; text: "Close current application windows before launching"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
-        }
-
-        Row {
-          width: parent.width
-          Text { width: parent.width - addAppButton.width; text: "Applications"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body; font.bold: true }
           Rectangle {
-            id: addAppButton
-            width: Style.space(90); height: Style.space(30); radius: Style.space(5)
-            color: addAppMouse.containsMouse ? Util.alpha(root.foreground, 0.16) : Util.alpha(root.foreground, 0.07)
-            Text { anchors.centerIn: parent; text: "+ App"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
-            MouseArea { id: addAppMouse; anchors.fill: parent; hoverEnabled: true; onClicked: appEditModel.append({ appName: "Application", workspace: "1", command: "", match: "" }) }
+            width: Style.space(118); height: Style.space(30); radius: Style.space(5)
+            color: addAppMouse.containsMouse ? Util.alpha(root.foreground, 0.18) : Util.alpha(root.foreground, 0.08)
+            Text { anchors.centerIn: parent; text: "+ Pick Application"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+            MouseArea { id: addAppMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.openPicker(-1) }
           }
         }
 
         ListView {
           id: appList
           width: parent.width
-          height: Style.space(350)
+          height: Style.space(390)
           clip: true
           spacing: Style.space(7)
           model: appEditModel
@@ -547,20 +729,26 @@ Panel {
             required property int index
             required property string appName
             required property string workspace
+            required property string desktopId
             required property string command
             required property string match
+            required property bool reuseExisting
+            required property string icon
             width: appList.width
-            height: Style.space(105)
+            height: Style.space(126)
             radius: Style.space(7)
             color: Util.alpha(root.foreground, 0.04)
 
             Column {
-              anchors.fill: parent
-              anchors.margins: Style.space(7)
-              spacing: Style.space(5)
+              anchors.fill: parent; anchors.margins: Style.space(7); spacing: Style.space(5)
 
               Row {
                 width: parent.width; spacing: Style.space(7)
+                Item {
+                  width: Style.space(32); height: Style.space(32)
+                  Image { anchors.fill: parent; source: root.appIconSource(appRow.icon); fillMode: Image.PreserveAspectFit; asynchronous: true }
+                  Text { anchors.centerIn: parent; visible: !appRow.icon; text: "•"; color: root.mutedText; font.pixelSize: Style.font.subtitle }
+                }
                 Rectangle {
                   width: Style.space(46); height: Style.space(31); radius: Style.space(5); color: Util.alpha(root.foreground, 0.07)
                   TextInput {
@@ -569,18 +757,23 @@ Panel {
                   }
                 }
                 Rectangle {
-                  width: Style.space(150); height: Style.space(31); radius: Style.space(5); color: Util.alpha(root.foreground, 0.07)
+                  width: Style.space(175); height: Style.space(31); radius: Style.space(5); color: Util.alpha(root.foreground, 0.07)
                   TextInput {
                     anchors.fill: parent; anchors.margins: Style.space(5); text: appRow.appName; color: root.foreground; font.family: root.fontFamily; verticalAlignment: TextInput.AlignVCenter; selectByMouse: true; clip: true
                     onTextEdited: appEditModel.setProperty(appRow.index, "appName", text)
                   }
                 }
+                Text {
+                  width: parent.width - Style.space(32) - Style.space(46) - Style.space(175) - changeAppButton.width - removeAppButton.width - Style.space(42)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: appRow.desktopId ? "Desktop: " + appRow.desktopId : "Command: " + (appRow.command || "not set")
+                  color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; elide: Text.ElideMiddle
+                }
                 Rectangle {
-                  width: parent.width - Style.space(46) - Style.space(150) - removeAppButton.width - Style.space(28); height: Style.space(31); radius: Style.space(5); color: Util.alpha(root.foreground, 0.07)
-                  TextInput {
-                    anchors.fill: parent; anchors.margins: Style.space(5); text: appRow.command; color: root.foreground; font.family: root.fontFamily; verticalAlignment: TextInput.AlignVCenter; selectByMouse: true; clip: true
-                    onTextEdited: appEditModel.setProperty(appRow.index, "command", text)
-                  }
+                  id: changeAppButton
+                  width: Style.space(64); height: Style.space(31); radius: Style.space(5); color: changeAppMouse.containsMouse ? Util.alpha(root.foreground, 0.16) : Util.alpha(root.foreground, 0.07)
+                  Text { anchors.centerIn: parent; text: "Change"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                  MouseArea { id: changeAppMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.openPicker(appRow.index) }
                 }
                 Rectangle {
                   id: removeAppButton
@@ -592,18 +785,30 @@ Panel {
 
               Row {
                 width: parent.width; spacing: Style.space(7)
-                Text { width: Style.space(196); text: "WS   Name"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                Text { text: "Launch command"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-              }
-
-              Row {
-                width: parent.width; spacing: Style.space(7)
-                Text { width: Style.space(88); anchors.verticalCenter: parent.verticalCenter; text: "Window match"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                Text { width: Style.space(92); anchors.verticalCenter: parent.verticalCenter; text: "Window match"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                 Rectangle {
-                  width: parent.width - Style.space(95); height: Style.space(27); radius: Style.space(5); color: Util.alpha(root.foreground, 0.06)
+                  width: parent.width - Style.space(250); height: Style.space(29); radius: Style.space(5); color: Util.alpha(root.foreground, 0.06)
                   TextInput {
                     anchors.fill: parent; anchors.margins: Style.space(5); text: appRow.match; color: root.foreground; font.family: root.fontFamily; verticalAlignment: TextInput.AlignVCenter; selectByMouse: true; clip: true
                     onTextEdited: appEditModel.setProperty(appRow.index, "match", text)
+                  }
+                }
+                Rectangle {
+                  width: Style.space(142); height: Style.space(29); radius: Style.space(5)
+                  color: appRow.reuseExisting ? Util.alpha(root.foreground, 0.16) : Util.alpha(root.foreground, 0.055)
+                  Text { anchors.centerIn: parent; text: appRow.reuseExisting ? "Reuse existing: ON" : "Reuse existing: OFF"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                  MouseArea { anchors.fill: parent; onClicked: appEditModel.setProperty(appRow.index, "reuseExisting", !appRow.reuseExisting) }
+                }
+              }
+
+              Row {
+                width: parent.width; spacing: Style.space(7); visible: !appRow.desktopId
+                Text { width: Style.space(92); anchors.verticalCenter: parent.verticalCenter; text: "Command"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                Rectangle {
+                  width: parent.width - Style.space(99); height: Style.space(29); radius: Style.space(5); color: Util.alpha(root.foreground, 0.06)
+                  TextInput {
+                    anchors.fill: parent; anchors.margins: Style.space(5); text: appRow.command; color: root.foreground; font.family: root.fontFamily; verticalAlignment: TextInput.AlignVCenter; selectByMouse: true; clip: true
+                    onTextEdited: appEditModel.setProperty(appRow.index, "command", text)
                   }
                 }
               }
@@ -616,15 +821,8 @@ Panel {
           Rectangle {
             width: Style.space(122); height: Style.space(34); radius: Style.space(6)
             color: startupMouse.containsMouse ? Util.alpha(root.foreground, 0.16) : Util.alpha(root.foreground, 0.07)
-            Text {
-              anchors.centerIn: parent
-              text: String(root.configData.startupWorkflow || "") === root.selectedWorkflowId ? "Clear login" : "Run at login"
-              color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
-            }
-            MouseArea {
-              id: startupMouse; anchors.fill: parent; hoverEnabled: true
-              onClicked: root.setStartup(String(root.configData.startupWorkflow || "") === root.selectedWorkflowId ? "" : root.selectedWorkflowId)
-            }
+            Text { anchors.centerIn: parent; text: String(root.configData.startupWorkflow || "") === root.selectedWorkflowId ? "Clear login" : "Run at login"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+            MouseArea { id: startupMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.setStartup(String(root.configData.startupWorkflow || "") === root.selectedWorkflowId ? "" : root.selectedWorkflowId) }
           }
           Rectangle {
             width: Style.space(82); height: Style.space(34); radius: Style.space(6)
@@ -644,12 +842,74 @@ Panel {
 
         Text {
           width: parent.width
-          text: root.statusMessage || "Window match is a case-insensitive regex for the app's Hyprland class/title, e.g. md\\.obsidian\\.Obsidian or spotify."
+          text: root.statusMessage || "Picker apps use their .desktop entry, so native apps, Flatpaks and Omarchy web apps launch the same way as the normal app menu."
           color: root.statusError ? root.bar.urgent : root.mutedText
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          wrapMode: Text.WordWrap
+          font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap
         }
+      }
+
+      Column {
+        id: pickerPage
+        anchors.fill: parent
+        spacing: Style.space(9)
+        visible: root.mode === "picker"
+
+        Row {
+          width: parent.width; spacing: Style.space(8)
+          Rectangle {
+            width: Style.space(64); height: Style.space(32); radius: Style.space(5)
+            color: backPickerMouse.containsMouse ? Util.alpha(root.foreground, 0.16) : Util.alpha(root.foreground, 0.07)
+            Text { anchors.centerIn: parent; text: "← Back"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+            MouseArea { id: backPickerMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.mode = "edit" }
+          }
+          Text { anchors.verticalCenter: parent.verticalCenter; text: root.pickerReplaceIndex >= 0 ? "Change Application" : "Add Application"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true }
+        }
+
+        Rectangle {
+          width: parent.width; height: Style.space(38); radius: Style.space(6); color: Util.alpha(root.foreground, 0.07)
+          TextInput {
+            id: pickerSearch
+            anchors.fill: parent; anchors.margins: Style.space(7)
+            color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body; verticalAlignment: TextInput.AlignVCenter; selectByMouse: true
+            onTextChanged: root.pickerQuery = text
+          }
+          Text { anchors.left: parent.left; anchors.leftMargin: Style.space(8); anchors.verticalCenter: parent.verticalCenter; visible: !pickerSearch.text; text: "Search installed applications, Flatpaks and web apps…"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+        }
+
+        Text { text: pickerModel.values.length + " matching applications"; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+
+        ListView {
+          width: parent.width
+          height: Style.space(455)
+          clip: true
+          spacing: Style.space(5)
+          model: pickerModel
+
+          delegate: Rectangle {
+            id: pickerRow
+            required property var modelData
+            width: ListView.view.width
+            height: Style.space(62)
+            radius: Style.space(6)
+            color: pickerMouse.containsMouse ? Util.alpha(root.foreground, 0.09) : Util.alpha(root.foreground, 0.035)
+
+            Row {
+              anchors.fill: parent; anchors.margins: Style.space(7); spacing: Style.space(9)
+              Item {
+                width: Style.space(38); height: width; anchors.verticalCenter: parent.verticalCenter
+                Image { anchors.fill: parent; source: pickerRow.modelData.icon ? Quickshell.iconPath(pickerRow.modelData.icon, true) : ""; fillMode: Image.PreserveAspectFit; asynchronous: true }
+              }
+              Column {
+                width: parent.width - Style.space(48); anchors.verticalCenter: parent.verticalCenter; spacing: Style.space(2)
+                Text { width: parent.width; text: pickerRow.modelData.name; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body; font.bold: true; elide: Text.ElideRight }
+                Text { width: parent.width; text: pickerRow.modelData.id + (pickerRow.modelData.comment ? " · " + pickerRow.modelData.comment : ""); color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.caption; elide: Text.ElideRight }
+              }
+            }
+            MouseArea { id: pickerMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.chooseDesktopEntry(pickerRow.modelData) }
+          }
+        }
+
+        Text { width: parent.width; text: "Applications are launched by desktop-file ID with gtk-launch, preserving Flatpak and Omarchy web-app launch behaviour."; color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
       }
 
       Rectangle {
@@ -657,35 +917,23 @@ Panel {
         z: 100
         visible: root.confirmOpen
         color: Util.alpha(root.background, 0.96)
-
         MouseArea { anchors.fill: parent }
 
         Column {
-          width: Math.min(parent.width - Style.space(60), Style.space(460))
+          width: Math.min(parent.width - Style.space(60), Style.space(500))
           anchors.centerIn: parent
           spacing: Style.space(12)
 
+          Text { width: parent.width; text: "Switch to " + root.confirmWorkflowName + "?"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.subtitle; font.bold: true; horizontalAlignment: Text.AlignHCenter }
           Text {
             width: parent.width
-            text: "Switch to " + root.confirmWorkflowName + "?"
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.subtitle
-            font.bold: true
-            horizontalAlignment: Text.AlignHCenter
-          }
-          Text {
-            width: parent.width
-            text: "This will send a normal close request to " + root.confirmWindowCount + " current window" + (root.confirmWindowCount === 1 ? "" : "s") + ". Apps with unsaved work may ask you to save before closing. It will not force-kill them."
-            color: root.mutedText
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-            horizontalAlignment: Text.AlignHCenter
+            text: root.confirmShutdownMode === "all"
+              ? "This will send a normal close request to " + root.confirmWindowCount + " currently open window" + (root.confirmWindowCount === 1 ? "" : "s") + ". Unsaved apps may ask you to save."
+              : "This will close " + root.confirmWindowCount + " window" + (root.confirmWindowCount === 1 ? "" : "s") + " from the currently active workflow. Applications marked Reuse existing in the new workflow are kept and moved instead."
+            color: root.mutedText; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap; horizontalAlignment: Text.AlignHCenter
           }
           Row {
-            anchors.horizontalCenter: parent.horizontalCenter
-            spacing: Style.space(10)
+            anchors.horizontalCenter: parent.horizontalCenter; spacing: Style.space(10)
             Rectangle {
               width: Style.space(90); height: Style.space(36); radius: Style.space(6); color: cancelMouse.containsMouse ? Util.alpha(root.foreground, 0.16) : Util.alpha(root.foreground, 0.07)
               Text { anchors.centerIn: parent; text: "Cancel"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
@@ -693,7 +941,7 @@ Panel {
             }
             Rectangle {
               width: Style.space(122); height: Style.space(36); radius: Style.space(6); color: switchMouse.containsMouse ? Util.alpha(root.foreground, 0.24) : Util.alpha(root.foreground, 0.12)
-              Text { anchors.centerIn: parent; text: "Close & Launch"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true }
+              Text { anchors.centerIn: parent; text: "Switch"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true }
               MouseArea { id: switchMouse; anchors.fill: parent; hoverEnabled: true; onClicked: root.launchWorkflow(root.confirmWorkflowId, root.confirmWorkflowName) }
             }
           }

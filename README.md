@@ -1,79 +1,120 @@
 # Omarchy Workflows
 
-A top-bar workflow launcher for Omarchy Quattro.
+A top-bar workflow/session launcher for Omarchy Quattro.
 
-Pick a workflow and the plugin can gracefully close the current application windows, launch a new set of applications into assigned Hyprland workspaces, and leave you on the workflow's chosen starting workspace.
+Workflows lets you capture or build reusable desktop setups, then switch between them with one click. Each application can be assigned to a Hyprland workspace and can either reuse an existing window or launch a new one.
 
-## Included starter workflows
+## v0.2.0 highlights
+
+- Searchable **application picker** powered by Quickshell `DesktopEntries`
+- Picker works with normal apps, Flatpaks and Omarchy web apps that expose `.desktop` entries
+- **Capture Desktop** creates a workflow from your currently open Hyprland windows
+- **Reuse existing** per app: move an existing matching window instead of launching a duplicate
+- Three workflow shutdown modes:
+  - **Close current workflow** — close apps belonging to the previously active workflow, but preserve apps the new workflow will reuse
+  - **Keep existing windows** — close nothing
+  - **Close all windows** — graceful close request to every current Hyprland client
+- Existing v0.1 configuration is migrated automatically to the v2 data format
+- Desktop-entry apps are launched via `gtk-launch`, so Flatpak/web-app launcher details stay inside their normal desktop file
+
+## Example
 
 ### Work
 
-- Workspace 1 — Browser (`omarchy-launch-browser`)
-- Workspace 2 — Obsidian (`obsidian`)
-- Workspace 3 — Zotero (`zotero`)
-- Workspace 4 — Spotify (`omarchy-launch-spotify`)
+- Workspace 1 — Browser
+- Workspace 2 — Obsidian
+- Workspace 3 — Zotero Flatpak
+- Workspace 4 — Spotify
 
 ### Relax
 
 - Workspace 1 — Browser
-- Workspace 2 — Steam (`steam`)
+- Workspace 2 — Steam
 
-Everything is editable from the panel.
+If Browser is already open when switching from Work to Relax and **Reuse existing** is enabled, Workflows moves that existing browser window to Relax's requested workspace instead of opening another browser.
 
-## Features
+## Application picker
 
-- Omarchy Quattro `bar-widget` with an anchored popup panel
-- Unlimited named workflows
-- Add/remove applications within each workflow
-- Assign each application to a numeric Hyprland workspace
-- Optional "close current windows first" per workflow
-- Graceful window closing — no SIGKILL
-- Confirmation showing how many open windows will receive a close request
-- Configurable start workspace
-- Optional workflow to run automatically at Hyprland login
-- Window-class/title matcher fallback for Chromium/Electron/single-instance applications
-- Tracks the most recently launched workflow for the bar tooltip
+Choose **Edit → Pick Application** and search your installed application database.
 
-## Why the window matcher exists
-
-Hyprland can launch an application with a one-shot workspace rule. Some applications hand window creation to an already-running or forked process, which can cause that rule to be missed. Workflows therefore supports an optional case-insensitive regex in **Window match**. It looks at the new window's `class`, `initialClass`, `title`, and `initialTitle`, then silently relocates matching windows to the requested workspace.
-
-Examples:
+The picker uses the desktop-entry ID instead of requiring you to know commands such as:
 
 ```text
-Obsidian: obsidian|md\.obsidian\.Obsidian
-Spotify: spotify
-Steam: steam
-Browser: chromium|firefox|zen|brave|google-chrome|helium
+flatpak run org.zotero.Zotero
+omarchy-launch-webapp https://chatgpt.com
 ```
 
-You can inspect live window properties with:
+For example, selecting Zotero stores its desktop entry (`org.zotero.Zotero`) and selecting the Omarchy ChatGPT web app stores the ChatGPT desktop entry. At launch time Workflows uses:
 
 ```bash
-hyprctl clients
+gtk-launch <desktop-entry-id>
 ```
 
-## Safety
+You can still use **Custom** when you genuinely want an arbitrary command.
 
-When `Close current application windows` is enabled, the plugin reads current Hyprland clients and sends each one a **graceful close request**. It does not use Hyprland's kill dispatcher and does not send SIGKILL.
+## Capture Desktop
 
-Applications with unsaved work may therefore remain open and present their normal save confirmation. The new workflow still launches; this is intentional to avoid destroying unsaved work.
+Arrange your desktop how you want it, then choose **Capture Desktop**.
+
+Workflows reads `hyprctl clients -j`, records each application's workspace, and uses Quickshell's desktop-entry lookup to identify the application where possible. The captured workflow opens immediately in the editor so you can review it before relying on it.
+
+Multiple windows from the same detected application are collapsed to one workflow app entry. Applications that cannot be matched to a desktop entry are captured on a best-effort basis and should have their command checked in the editor.
+
+## Reuse existing applications
+
+Each app row has **Reuse existing: ON/OFF**.
+
+When ON and a matcher finds an existing window, Workflows:
+
+1. does not launch a duplicate;
+2. silently moves the matching existing window to the requested workspace;
+3. keeps that app alive when using **Close current workflow** and the same app is part of the new workflow.
+
+The matcher is a case-insensitive regex against Hyprland `class`, `initialClass`, `title`, and `initialTitle`.
+
+The picker creates a matcher from the desktop entry's `StartupWMClass`, desktop-file ID and application name. You can edit it manually when an app has unusual window behaviour.
+
+## Shutdown behaviour
+
+### Close current workflow
+
+Recommended default.
+
+Only windows belonging to the plugin's previously active workflow are closed. Windows unrelated to that workflow are left alone. Apps present in both workflows and marked **Reuse existing** are preserved and moved.
+
+### Keep existing windows
+
+Nothing is closed. Workflows reuses matching apps when possible and launches missing apps.
+
+### Close all windows
+
+Sends a normal close request to every current Hyprland client before setting up the new workflow.
+
+This is deliberately not a force-kill. Applications with unsaved work can show their normal save prompt.
 
 ## Configuration
 
-Workflow data is kept outside the plugin checkout so Git updates do not overwrite your workflows:
+Workflow data lives outside the Git checkout:
 
 ```text
 ~/.config/omarchy/workflows/workflows.json
 ```
 
-If you enable **Run at login**, the plugin manages:
+Updating the plugin does not overwrite your workflows.
+
+v0.1 configurations are migrated to version 2 automatically. The old `closeExisting: true` behaviour migrates to **Close all windows** to preserve its previous meaning; you can then change individual workflows to **Close current workflow** in the editor.
+
+## Login workflow
+
+A workflow can still be marked **Run at login**.
+
+The plugin manages:
 
 ```text
 ~/.config/hypr/omarchy_workflows_startup.lua
 ```
 
-and adds/removes only this marked block in `~/.config/hypr/autostart.lua`:
+and only this marked block in `~/.config/hypr/autostart.lua`:
 
 ```lua
 -- BEGIN omarchy-workflows
@@ -81,48 +122,35 @@ require("hypr.omarchy_workflows_startup")
 -- END omarchy-workflows
 ```
 
-## Validate before publishing
+## Validate on Omarchy
 
-On your Omarchy machine:
+Before pushing/installing a release:
 
 ```bash
+./self-test.sh
 omarchy plugin validate .
 qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml
-bash -n backend.sh
 ```
 
-## Suggested GitHub repository
+The included backend self-test covers configuration migration, desktop capture data, desktop-entry launching, reuse/move behaviour, close-current-workflow behaviour and close-all behaviour.
+
+## GitHub workflow
+
+Recommended repository:
 
 ```text
 https://github.com/crispsimpcrispy/omarchy-workflows
 ```
 
-Create it from this folder with:
+From your development checkout:
 
 ```bash
-git init
-git branch -M main
 git add .
-git commit -m "Initial release"
-
-gh repo create crispsimpcrispy/omarchy-workflows \
-  --public \
-  --source=. \
-  --remote=origin \
-  --push
+git commit -m "Add app picker, capture and smarter workflow switching"
+git push
 ```
 
-Then install the GitHub-managed copy:
-
-```bash
-omarchy plugin add \
-  https://github.com/crispsimpcrispy/omarchy-workflows.git \
-  --enable
-
-omarchy restart shell
-```
-
-Future updates:
+Then update the installed plugin:
 
 ```bash
 omarchy plugin update io.github.crispsimpcrispy.workflows --yes
@@ -131,13 +159,9 @@ omarchy restart shell
 
 ## Troubleshooting
 
-Check the backend:
-
 ```bash
 ~/.config/omarchy/plugins/io.github.crispsimpcrispy.workflows/backend.sh diagnose
 ```
-
-Check plugin/QML validation:
 
 ```bash
 omarchy plugin validate ~/.config/omarchy/plugins/io.github.crispsimpcrispy.workflows
@@ -146,19 +170,17 @@ qmllint -I "$OMARCHY_PATH/shell" \
   ~/.config/omarchy/plugins/io.github.crispsimpcrispy.workflows/Panel.qml
 ```
 
-Check the Omarchy shell log:
-
 ```bash
 qs log -p "$OMARCHY_PATH/shell" --tail 100
 ```
 
 ## Uninstall cleanup
 
-Removing the plugin does not delete your workflows. To remove its generated configuration too:
+Removing the plugin intentionally leaves your workflow data behind. To remove everything it generated:
 
 ```bash
 rm -rf ~/.config/omarchy/workflows
 rm -f ~/.config/hypr/omarchy_workflows_startup.lua
 ```
 
-Then remove the marked `omarchy-workflows` block from `~/.config/hypr/autostart.lua` if you had enabled a login workflow.
+Then remove the marked `omarchy-workflows` block from `~/.config/hypr/autostart.lua` if a login workflow was enabled.

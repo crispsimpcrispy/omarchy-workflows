@@ -20,9 +20,9 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || fail "Required command not fo
 
 seed_config() {
   [[ -f "$CONFIG_FILE" ]] && return 0
-  cat >"$CONFIG_FILE" <<'JSON'
+  cat >"$CONFIG_FILE" <<'JSON_EOF'
 {
-  "version": 1,
+  "version": 2,
   "activeWorkflow": "",
   "startupWorkflow": "",
   "workflows": [
@@ -30,29 +30,29 @@ seed_config() {
       "id": "work",
       "name": "Work",
       "icon": "W",
-      "closeExisting": true,
+      "shutdownMode": "current",
       "startWorkspace": 1,
       "apps": [
-        {"name":"Browser","workspace":1,"command":"omarchy-launch-browser","match":"chromium|firefox|zen|brave|google-chrome|helium"},
-        {"name":"Obsidian","workspace":2,"command":"obsidian","match":"obsidian|md\\.obsidian\\.Obsidian"},
-        {"name":"Zotero","workspace":3,"command":"zotero","match":"zotero"},
-        {"name":"Spotify","workspace":4,"command":"omarchy-launch-spotify","match":"spotify"}
+        {"name":"Browser","workspace":1,"desktopId":"","command":"omarchy-launch-browser","match":"chromium|firefox|zen|brave|google-chrome|helium","reuseExisting":true,"icon":""},
+        {"name":"Obsidian","workspace":2,"desktopId":"","command":"obsidian","match":"obsidian|md\\.obsidian\\.Obsidian","reuseExisting":true,"icon":"obsidian"},
+        {"name":"Zotero","workspace":3,"desktopId":"org.zotero.Zotero","command":"","match":"org\\.zotero\\.Zotero|zotero","reuseExisting":true,"icon":"zotero"},
+        {"name":"Spotify","workspace":4,"desktopId":"","command":"omarchy-launch-spotify","match":"spotify","reuseExisting":true,"icon":"spotify"}
       ]
     },
     {
       "id": "relax",
       "name": "Relax",
       "icon": "R",
-      "closeExisting": true,
+      "shutdownMode": "current",
       "startWorkspace": 1,
       "apps": [
-        {"name":"Browser","workspace":1,"command":"omarchy-launch-browser","match":"chromium|firefox|zen|brave|google-chrome|helium"},
-        {"name":"Steam","workspace":2,"command":"steam","match":"steam"}
+        {"name":"Browser","workspace":1,"desktopId":"","command":"omarchy-launch-browser","match":"chromium|firefox|zen|brave|google-chrome|helium","reuseExisting":true,"icon":""},
+        {"name":"Steam","workspace":2,"desktopId":"steam","command":"steam","match":"steam","reuseExisting":true,"icon":"steam"}
       ]
     }
   ]
 }
-JSON
+JSON_EOF
 }
 
 atomic_jq() {
@@ -67,9 +67,34 @@ atomic_jq() {
   fi
 }
 
+migrate_config() {
+  seed_config
+  local version
+  version="$(jq -r '.version // 1' "$CONFIG_FILE" 2>/dev/null || echo 1)"
+  [[ "$version" -ge 2 ]] && return 0
+  atomic_jq '
+    .version=2
+    | .workflows |= map(
+        .shutdownMode=(if has("shutdownMode") then .shutdownMode elif (.closeExisting // true) then "all" else "keep" end)
+        | del(.closeExisting)
+        | .apps=((.apps // []) | map(
+            .desktopId=(.desktopId // "")
+            | .reuseExisting=(.reuseExisting // true)
+            | .icon=(.icon // "")
+          ))
+      )
+  '
+}
+
+normalize_shutdown_mode() {
+  case "${1:-}" in
+    keep|current|all) printf '%s' "$1" ;;
+    *) printf 'current' ;;
+  esac
+}
+
 lua_long_quote() {
-  local value="${1:-}" eq=""
-  local i close
+  local value="${1:-}" eq="" i close
   for i in {0..8}; do
     close="]${eq}]"
     if [[ "$value" != *"$close"* ]]; then
@@ -80,6 +105,8 @@ lua_long_quote() {
   done
   fail "Could not safely quote a command for Hyprland Lua"
 }
+
+shell_quote() { printf '%q' "${1:-}"; }
 
 hypr_close_window() {
   local selector="$1" q
@@ -114,79 +141,198 @@ hypr_launch_workspace() {
     || hyprctl dispatch exec "[workspace $workspace silent] $command" >/dev/null 2>&1
 }
 
-config() {
-  seed_config
-  cat "$CONFIG_FILE"
+app_launch_command() {
+  local app="$1" desktop_id command
+  desktop_id="$(jq -r '.desktopId // ""' <<<"$app")"
+  command="$(jq -r '.command // ""' <<<"$app")"
+  if [[ -n "$desktop_id" ]]; then
+    printf 'gtk-launch %s' "$(shell_quote "$desktop_id")"
+  else
+    printf '%s' "$command"
+  fi
 }
 
+config() { migrate_config; cat "$CONFIG_FILE"; }
+
 current() {
-  seed_config
+  migrate_config
   jq -r '.activeWorkflow as $id | (.workflows[]? | select(.id == $id) | .name) // ""' "$CONFIG_FILE"
 }
 
 add_workflow() {
-  seed_config
+  migrate_config
   local name="${1:-New Workflow}" icon="${2:-W}" id
   id="workflow-$(date +%s)-$RANDOM"
-  atomic_jq '.workflows += [{id:$id,name:$name,icon:$icon,closeExisting:true,startWorkspace:1,apps:[]}]' \
+  atomic_jq '.workflows += [{id:$id,name:$name,icon:$icon,shutdownMode:"current",startWorkspace:1,apps:[]}]' \
     --arg id "$id" --arg name "$name" --arg icon "$icon"
   jq -nc --arg id "$id" '{id:$id}'
 }
 
-replace_workflow() {
-  seed_config
-  local id="${1:?workflow id required}" raw="${2:?workflow JSON required}" normalized
-  jq -e . >/dev/null 2>&1 <<<"$raw" || fail "Workflow data is not valid JSON"
-  normalized="$(jq -c --arg id "$id" '
+normalize_workflow() {
+  local id="$1" raw="$2"
+  jq -c --arg id "$id" '
     .id=$id
-    | .name=(.name|tostring)
+    | .name=((.name // "Workflow")|tostring)
     | .icon=((.icon // "W")|tostring)
-    | .closeExisting=(.closeExisting != false)
+    | (.shutdownMode // "current") as $mode
+    | .shutdownMode=(if (["keep","current","all"] | index($mode)) then $mode else "current" end)
     | .startWorkspace=((.startWorkspace|tonumber) // 1)
     | .apps=((.apps // []) | map({
         name: ((.name // "Application")|tostring),
         workspace: ((.workspace|tonumber) // 1),
+        desktopId: ((.desktopId // "")|tostring),
         command: ((.command // "")|tostring),
-        match: ((.match // "")|tostring)
+        match: ((.match // "")|tostring),
+        reuseExisting: (.reuseExisting != false),
+        icon: ((.icon // "")|tostring)
       }))
     | select(.startWorkspace >= 1)
-    | select(all(.apps[]?; .workspace >= 1 and (.command|length) > 0))
-  ' <<<"$raw")" || fail "Workflow contains an invalid workspace or empty command"
+    | select(all(.apps[]?; .workspace >= 1 and (((.desktopId|length) > 0) or ((.command|length) > 0))))
+  ' <<<"$raw" || fail "Workflow contains an invalid workspace or an app with no desktop entry/command"
+}
 
+create_workflow_json() {
+  migrate_config
+  local raw="${1:?workflow JSON required}" id normalized
+  jq -e . >/dev/null 2>&1 <<<"$raw" || fail "Workflow data is not valid JSON"
+  id="workflow-$(date +%s)-$RANDOM"
+  normalized="$(normalize_workflow "$id" "$raw")"
+  atomic_jq '.workflows += [$workflow]' --argjson workflow "$normalized"
+  jq -nc --arg id "$id" '{id:$id}'
+}
+
+replace_workflow() {
+  migrate_config
+  local id="${1:?workflow id required}" raw="${2:?workflow JSON required}" normalized
+  jq -e . >/dev/null 2>&1 <<<"$raw" || fail "Workflow data is not valid JSON"
+  normalized="$(normalize_workflow "$id" "$raw")"
   jq -e --arg id "$id" '.workflows[] | select(.id==$id)' "$CONFIG_FILE" >/dev/null || fail "Unknown workflow: $id"
   atomic_jq '.workflows |= map(if .id==$id then $workflow else . end)' --arg id "$id" --argjson workflow "$normalized"
   printf 'Saved.\n'
 }
 
 delete_workflow() {
-  seed_config
+  migrate_config
   local id="${1:?workflow id required}"
   atomic_jq '.workflows |= map(select(.id != $id)) | if .activeWorkflow==$id then .activeWorkflow="" else . end | if .startupWorkflow==$id then .startupWorkflow="" else . end' --arg id "$id"
   sync_startup_hook
   printf 'Deleted.\n'
 }
 
-count_windows() {
+clients_json() {
   require_cmd hyprctl
   require_cmd jq
-  hyprctl clients -j 2>/dev/null | jq 'length'
+  hyprctl clients -j 2>/dev/null || printf '[]\n'
+}
+
+count_windows() { clients_json | jq 'length'; }
+
+window_matches_regex() {
+  local matcher="$1"
+  clients_json | jq -r --arg re "$matcher" '
+    .[]
+    | select(
+        ((.class // "") | test($re; "i")) or
+        ((.initialClass // "") | test($re; "i")) or
+        ((.title // "") | test($re; "i")) or
+        ((.initialTitle // "") | test($re; "i"))
+      )
+    | .address // empty
+  ' 2>/dev/null || true
+}
+
+first_existing_window() {
+  local matcher="$1"
+  [[ -n "$matcher" ]] || return 0
+  window_matches_regex "$matcher" | head -n1
+}
+
+app_identity() {
+  local app="$1" desktop match name
+  desktop="$(jq -r '.desktopId // ""' <<<"$app")"
+  match="$(jq -r '.match // ""' <<<"$app")"
+  name="$(jq -r '.name // ""' <<<"$app")"
+  if [[ -n "$desktop" ]]; then printf 'desktop:%s' "${desktop,,}"
+  elif [[ -n "$match" ]]; then printf 'match:%s' "${match,,}"
+  else printf 'name:%s' "${name,,}"
+  fi
+}
+
+target_reuses_identity() {
+  local target_apps="$1" identity="$2" app reuse
+  while IFS= read -r app; do
+    [[ -n "$app" ]] || continue
+    reuse="$(jq -r '.reuseExisting != false' <<<"$app")"
+    [[ "$reuse" == "true" ]] || continue
+    [[ "$(app_identity "$app")" == "$identity" ]] && return 0
+  done < <(jq -c '.[]' <<<"$target_apps")
+  return 1
 }
 
 close_all_windows() {
-  local addresses
-  addresses="$(hyprctl clients -j 2>/dev/null | jq -r '.[].address // empty')"
+  local addr
   while IFS= read -r addr; do
     [[ -n "$addr" ]] || continue
     hypr_close_window "address:$addr"
-  done <<<"$addresses"
+  done < <(clients_json | jq -r '.[].address // empty')
+}
 
-  # Give normal close requests a short chance to complete. Windows with unsaved
-  # data are deliberately left to show their application's own save prompt.
-  local i
-  for i in {1..15}; do
-    [[ "$(count_windows)" -eq 0 ]] && break
-    sleep 0.12
-  done
+close_current_workflow_windows() {
+  local target_apps="$1" active_id old apps app matcher identity addr seen=""
+  active_id="$(jq -r '.activeWorkflow // ""' "$CONFIG_FILE")"
+  [[ -n "$active_id" ]] || return 0
+  old="$(jq -c --arg id "$active_id" '.workflows[]? | select(.id==$id)' "$CONFIG_FILE")"
+  [[ -n "$old" ]] || return 0
+  apps="$(jq -c '.apps // []' <<<"$old")"
+  while IFS= read -r app; do
+    [[ -n "$app" ]] || continue
+    matcher="$(jq -r '.match // ""' <<<"$app")"
+    [[ -n "$matcher" ]] || continue
+    identity="$(app_identity "$app")"
+    target_reuses_identity "$target_apps" "$identity" && continue
+    while IFS= read -r addr; do
+      [[ -n "$addr" ]] || continue
+      if ! grep -Fxq "$addr" <<<"$seen"; then
+        hypr_close_window "address:$addr"
+        seen+="$addr"$'\n'
+      fi
+    done < <(window_matches_regex "$matcher")
+  done < <(jq -c '.[]' <<<"$apps")
+}
+
+count_current_workflow_windows() {
+  local target_apps="$1" active_id old apps app matcher identity addr seen=""
+  active_id="$(jq -r '.activeWorkflow // ""' "$CONFIG_FILE")"
+  [[ -n "$active_id" ]] || { echo 0; return; }
+  old="$(jq -c --arg id "$active_id" '.workflows[]? | select(.id==$id)' "$CONFIG_FILE")"
+  [[ -n "$old" ]] || { echo 0; return; }
+  apps="$(jq -c '.apps // []' <<<"$old")"
+  while IFS= read -r app; do
+    [[ -n "$app" ]] || continue
+    matcher="$(jq -r '.match // ""' <<<"$app")"
+    [[ -n "$matcher" ]] || continue
+    identity="$(app_identity "$app")"
+    target_reuses_identity "$target_apps" "$identity" && continue
+    while IFS= read -r addr; do
+      [[ -n "$addr" ]] || continue
+      if ! grep -Fxq "$addr" <<<"$seen"; then seen+="$addr"$'\n'; fi
+    done < <(window_matches_regex "$matcher")
+  done < <(jq -c '.[]' <<<"$apps")
+  grep -cve '^$' <<<"$seen" || true
+}
+
+count_close_for_target() {
+  migrate_config
+  local id="${1:?workflow id required}" workflow mode apps
+  workflow="$(jq -c --arg id "$id" '.workflows[]? | select(.id==$id)' "$CONFIG_FILE")"
+  [[ -n "$workflow" ]] || fail "Unknown workflow: $id"
+  mode="$(normalize_shutdown_mode "$(jq -r '.shutdownMode // "current"' <<<"$workflow")")"
+  apps="$(jq -c '.apps // []' <<<"$workflow")"
+  case "$mode" in
+    keep) echo 0 ;;
+    all) count_windows ;;
+    current) count_current_workflow_windows "$apps" ;;
+  esac
 }
 
 relocate_new_windows() {
@@ -197,13 +343,10 @@ relocate_new_windows() {
       workspace="$(jq -r '.workspace|tostring' <<<"$app")"
       matcher="$(jq -r '.match // ""' <<<"$app")"
       [[ -n "$matcher" ]] || continue
-
       while IFS= read -r addr; do
         [[ -n "$addr" ]] || continue
-        if ! grep -Fxq "$addr" "$baseline"; then
-          hypr_move_window "$workspace" "address:$addr"
-        fi
-      done < <(hyprctl clients -j 2>/dev/null | jq -r --arg re "$matcher" --arg target "$workspace" '
+        if ! grep -Fxq "$addr" "$baseline"; then hypr_move_window "$workspace" "address:$addr"; fi
+      done < <(clients_json | jq -r --arg re "$matcher" --arg target "$workspace" '
         .[]
         | select(
             ((.class // "") | test($re; "i")) or
@@ -215,55 +358,87 @@ relocate_new_windows() {
         | .address // empty
       ' 2>/dev/null || true)
     done < <(jq -c '.[]' <<<"$apps_json")
-    sleep 0.35
+    sleep 0.30
   done
 }
 
 run_workflow() {
-  seed_config
+  migrate_config
   require_cmd hyprctl
   require_cmd jq
-  local id="${1:?workflow id required}" workflow close_existing start_ws apps baseline app ws command
+  local id="${1:?workflow id required}" workflow mode start_ws apps baseline app ws matcher reuse existing command desktop_id
   workflow="$(jq -c --arg id "$id" '.workflows[]? | select(.id==$id)' "$CONFIG_FILE")"
   [[ -n "$workflow" ]] || fail "Unknown workflow: $id"
-  close_existing="$(jq -r '.closeExisting != false' <<<"$workflow")"
+  mode="$(normalize_shutdown_mode "$(jq -r '.shutdownMode // "current"' <<<"$workflow")")"
   start_ws="$(jq -r '.startWorkspace|tostring' <<<"$workflow")"
   apps="$(jq -c '.apps // []' <<<"$workflow")"
-
-  if [[ "$close_existing" == "true" ]]; then
-    close_all_windows
-  fi
+  case "$mode" in
+    all) close_all_windows; sleep 1 ;;
+    current) close_current_workflow_windows "$apps"; sleep 1 ;;
+    keep) : ;;
+  esac
 
   baseline="$(mktemp "$STATE_DIR/.baseline.XXXXXX")"
-  hyprctl clients -j 2>/dev/null | jq -r '.[].address // empty' | sort -u >"$baseline"
+  clients_json | jq -r '.[].address // empty' | sort -u >"$baseline"
 
   while IFS= read -r app; do
     [[ -n "$app" ]] || continue
     ws="$(jq -r '.workspace|tostring' <<<"$app")"
-    command="$(jq -r '.command' <<<"$app")"
+    matcher="$(jq -r '.match // ""' <<<"$app")"
+    reuse="$(jq -r '.reuseExisting != false' <<<"$app")"
+    if [[ "$reuse" == "true" && -n "$matcher" ]]; then
+      existing="$(first_existing_window "$matcher")"
+      if [[ -n "$existing" ]]; then
+        hypr_move_window "$ws" "address:$existing"
+        continue
+      fi
+    fi
+    desktop_id="$(jq -r '.desktopId // ""' <<<"$app")"
+    [[ -z "$desktop_id" ]] || require_cmd gtk-launch
+    command="$(app_launch_command "$app")"
     [[ -n "$command" ]] || continue
     hypr_launch_workspace "$ws" "$command" || true
     sleep 0.12
   done < <(jq -c '.[]' <<<"$apps")
 
-  # One-shot exec rules can be lost when an app forks or delegates window
-  # creation (notably Chromium/Electron). Match only windows created after the
-  # workflow started and silently relocate them as a fallback.
   relocate_new_windows "$baseline" "$apps"
   hypr_focus_workspace "$start_ws"
-
   rm -f "$baseline"
   atomic_jq '.activeWorkflow=$id' --arg id "$id"
   printf 'Launched %s.\n' "$(jq -r '.name' <<<"$workflow")"
 }
 
+capture_windows() {
+  require_cmd hyprctl
+  require_cmd jq
+  local clients active_ws
+  clients="$(clients_json)"
+  active_ws="$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // 1' 2>/dev/null || echo 1)"
+  jq -n --argjson activeWorkspace "$active_ws" --argjson clients "$clients" '{
+    activeWorkspace: $activeWorkspace,
+    windows: [
+      $clients[]
+      | select((.mapped // true) != false)
+      | {
+          address:(.address // ""),
+          workspace:((.workspace.id // 1) | tonumber),
+          class:(.class // ""),
+          initialClass:(.initialClass // ""),
+          title:(.title // ""),
+          initialTitle:(.initialTitle // ""),
+          pid:(.pid // 0)
+        }
+    ]
+  }'
+}
+
 write_startup_file() {
-  cat >"$STARTUP_FILE" <<EOF
+  cat >"$STARTUP_FILE" <<STARTUP_EOF
 -- Generated by Omarchy Workflows. Do not edit this file by hand.
 hl.on("hyprland.start", function()
   hl.exec_cmd("bash -lc 'sleep 2; ${PLUGIN_BACKEND} run-startup >/dev/null 2>&1 &'" )
 end)
-EOF
+STARTUP_EOF
 }
 
 remove_hook_block() {
@@ -279,15 +454,11 @@ remove_hook_block() {
 }
 
 sync_startup_hook() {
-  seed_config
+  migrate_config
   local id
   id="$(jq -r '.startupWorkflow // ""' "$CONFIG_FILE")"
   remove_hook_block
-  if [[ -z "$id" ]]; then
-    rm -f "$STARTUP_FILE"
-    return 0
-  fi
-
+  if [[ -z "$id" ]]; then rm -f "$STARTUP_FILE"; return 0; fi
   write_startup_file
   touch "$AUTOSTART_FILE"
   {
@@ -298,7 +469,7 @@ sync_startup_hook() {
 }
 
 set_startup() {
-  seed_config
+  migrate_config
   local id="${1:-}"
   if [[ -n "$id" ]]; then
     jq -e --arg id "$id" '.workflows[] | select(.id==$id)' "$CONFIG_FILE" >/dev/null || fail "Unknown workflow: $id"
@@ -309,7 +480,7 @@ set_startup() {
 }
 
 run_startup() {
-  seed_config
+  migrate_config
   local id
   id="$(jq -r '.startupWorkflow // ""' "$CONFIG_FILE")"
   [[ -n "$id" ]] || exit 0
@@ -317,29 +488,34 @@ run_startup() {
 }
 
 diagnose() {
-  seed_config
+  migrate_config
   printf 'Config: %s\n' "$CONFIG_FILE"
   jq -e . "$CONFIG_FILE" >/dev/null && printf 'JSON: OK\n'
   command -v hyprctl >/dev/null && printf 'hyprctl: OK\n' || printf 'hyprctl: MISSING\n'
   command -v jq >/dev/null && printf 'jq: OK\n' || printf 'jq: MISSING\n'
+  command -v gtk-launch >/dev/null && printf 'gtk-launch: OK\n' || printf 'gtk-launch: MISSING (application picker entries need gtk3)\n'
+  printf 'Version: %s\n' "$(jq -r '.version // 1' "$CONFIG_FILE")"
   printf 'Workflows: %s\n' "$(jq '.workflows|length' "$CONFIG_FILE")"
   printf 'Current: %s\n' "$(current)"
   printf 'Open windows: %s\n' "$(count_windows 2>/dev/null || echo '?')"
 }
 
-seed_config
+migrate_config
 
 case "${1:-config}" in
   config) config ;;
   current) current ;;
   add-workflow) shift; add_workflow "$@" ;;
+  create-workflow-json) shift; create_workflow_json "$@" ;;
   replace-workflow) shift; replace_workflow "$@" ;;
   delete-workflow) shift; delete_workflow "$@" ;;
   count-windows) count_windows ;;
+  count-close) shift; count_close_for_target "$@" ;;
+  capture) capture_windows ;;
   run) shift; run_workflow "$@" ;;
   set-startup) shift; set_startup "$@" ;;
   run-startup) run_startup ;;
   sync-startup) sync_startup_hook ;;
   diagnose) diagnose ;;
-  *) fail "Usage: $0 {config|current|add-workflow|replace-workflow|delete-workflow|count-windows|run|set-startup|run-startup|sync-startup|diagnose}" ;;
+  *) fail "Usage: $0 {config|current|add-workflow|create-workflow-json|replace-workflow|delete-workflow|count-windows|count-close|capture|run|set-startup|run-startup|sync-startup|diagnose}" ;;
 esac

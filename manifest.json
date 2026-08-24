@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.crispsimpcrispy.workflows",
   "name": "Workflows",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "crispsimpcrispy",
   "license": "MIT",
-  "description": "Switch between reusable Omarchy desktop workflows from the top bar.",
+  "description": "Capture, edit and switch reusable Omarchy desktop workflows from the top bar.",
   "kinds": [
     "bar-widget"
   ],
