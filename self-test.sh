@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 printf 'Checking manifest JSON... '
-jq -e '.schemaVersion==1 and .id=="io.github.crispsimpcrispy.workflows" and .version=="0.2.0" and (.kinds|index("bar-widget")!=null) and .entryPoints.barWidget=="BarWidget.qml"' manifest.json >/dev/null
+jq -e '.schemaVersion==1 and .id=="io.github.crispsimpcrispy.workflows" and .version=="0.2.1" and (.kinds|index("bar-widget")!=null) and .entryPoints.barWidget=="BarWidget.qml"' manifest.json >/dev/null
 printf 'OK\n'
 
 printf 'Checking backend shell syntax... '
@@ -74,7 +74,11 @@ printf '  captured/picker data model: OK\n'
 
 # Set Work active, then switch to Relax. Browser is shared/reusable, Spotify is
 # part of the old workflow and should close, terminal is unrelated and should stay.
-jq '.activeWorkflow="work"' "$XDG_CONFIG_HOME/omarchy/workflows/workflows.json" >"$tmp/config.new"
+jq '
+  .activeWorkflow="work"
+  | (.workflows[] | select(.id=="relax") | .apps[] | select(.name=="Browser") | .desktopId)="org.chromium.Chromium"
+  | (.workflows[] | select(.id=="relax") | .apps[] | select(.name=="Browser") | .match)="^chromium$"
+' "$XDG_CONFIG_HOME/omarchy/workflows/workflows.json" >"$tmp/config.new"
 mv "$tmp/config.new" "$XDG_CONFIG_HOME/omarchy/workflows/workflows.json"
 : >"$log"
 ./backend.sh run relax >/dev/null

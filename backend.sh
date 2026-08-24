@@ -269,6 +269,29 @@ target_reuses_identity() {
   return 1
 }
 
+# Resolve the *actual currently-open Hyprland window addresses* that the target
+# workflow wants to reuse.  Address-based protection is more reliable than
+# comparing saved desktop IDs/matchers because the same app can be represented
+# differently after using the application picker (for example a legacy custom
+# matcher in one workflow and a desktop-entry ID in another).
+reusable_target_addresses() {
+  local target_apps="$1" app reuse matcher addr seen=""
+  while IFS= read -r app; do
+    [[ -n "$app" ]] || continue
+    reuse="$(jq -r '.reuseExisting != false' <<<"$app")"
+    [[ "$reuse" == "true" ]] || continue
+    matcher="$(jq -r '.match // ""' <<<"$app")"
+    [[ -n "$matcher" ]] || continue
+    while IFS= read -r addr; do
+      [[ -n "$addr" ]] || continue
+      if ! grep -Fxq "$addr" <<<"$seen"; then
+        printf '%s\n' "$addr"
+        seen+="$addr"$'\n'
+      fi
+    done < <(window_matches_regex "$matcher")
+  done < <(jq -c '.[]' <<<"$target_apps")
+}
+
 close_all_windows() {
   local addr
   while IFS= read -r addr; do
@@ -278,7 +301,8 @@ close_all_windows() {
 }
 
 close_current_workflow_windows() {
-  local target_apps="$1" active_id old apps app matcher identity addr seen=""
+  local target_apps="$1" active_id old apps app matcher addr seen="" protected
+  protected="$(reusable_target_addresses "$target_apps")"
   active_id="$(jq -r '.activeWorkflow // ""' "$CONFIG_FILE")"
   [[ -n "$active_id" ]] || return 0
   old="$(jq -c --arg id "$active_id" '.workflows[]? | select(.id==$id)' "$CONFIG_FILE")"
@@ -288,10 +312,11 @@ close_current_workflow_windows() {
     [[ -n "$app" ]] || continue
     matcher="$(jq -r '.match // ""' <<<"$app")"
     [[ -n "$matcher" ]] || continue
-    identity="$(app_identity "$app")"
-    target_reuses_identity "$target_apps" "$identity" && continue
     while IFS= read -r addr; do
       [[ -n "$addr" ]] || continue
+      # Never close a concrete window the target workflow intends to reuse,
+      # even if the old and new workflow store different app identities.
+      grep -Fxq "$addr" <<<"$protected" && continue
       if ! grep -Fxq "$addr" <<<"$seen"; then
         hypr_close_window "address:$addr"
         seen+="$addr"$'\n'
@@ -301,7 +326,8 @@ close_current_workflow_windows() {
 }
 
 count_current_workflow_windows() {
-  local target_apps="$1" active_id old apps app matcher identity addr seen=""
+  local target_apps="$1" active_id old apps app matcher addr seen="" protected
+  protected="$(reusable_target_addresses "$target_apps")"
   active_id="$(jq -r '.activeWorkflow // ""' "$CONFIG_FILE")"
   [[ -n "$active_id" ]] || { echo 0; return; }
   old="$(jq -c --arg id "$active_id" '.workflows[]? | select(.id==$id)' "$CONFIG_FILE")"
@@ -311,10 +337,9 @@ count_current_workflow_windows() {
     [[ -n "$app" ]] || continue
     matcher="$(jq -r '.match // ""' <<<"$app")"
     [[ -n "$matcher" ]] || continue
-    identity="$(app_identity "$app")"
-    target_reuses_identity "$target_apps" "$identity" && continue
     while IFS= read -r addr; do
       [[ -n "$addr" ]] || continue
+      grep -Fxq "$addr" <<<"$protected" && continue
       if ! grep -Fxq "$addr" <<<"$seen"; then seen+="$addr"$'\n'; fi
     done < <(window_matches_regex "$matcher")
   done < <(jq -c '.[]' <<<"$apps")

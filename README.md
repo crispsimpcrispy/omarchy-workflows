@@ -1,10 +1,12 @@
 # Omarchy Workflows
 
+> **v0.2.1:** fixes reuse across workflows by protecting the actual open Hyprland window addresses before the shutdown phase.
+
 A top-bar workflow/session launcher for Omarchy Quattro.
 
 Workflows lets you capture or build reusable desktop setups, then switch between them with one click. Each application can be assigned to a Hyprland workspace and can either reuse an existing window or launch a new one.
 
-## v0.2.0 highlights
+## v0.2.1 highlights
 
 - Searchable **application picker** powered by Quickshell `DesktopEntries`
 - Picker works with normal apps, Flatpaks and Omarchy web apps that expose `.desktop` entries
