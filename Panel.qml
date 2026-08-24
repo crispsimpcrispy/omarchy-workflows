@@ -82,7 +82,7 @@ Panel {
   }
 
   function shutdownLabel(mode) {
-    if (mode === "all") return "Close all windows"
+    if (mode === "all") return "Close all other windows"
     if (mode === "keep") return "Keep everything"
     return "Close current workflow"
   }
@@ -684,7 +684,7 @@ Panel {
             model: [
               { value: "current", label: "Close current workflow" },
               { value: "keep", label: "Keep existing windows" },
-              { value: "all", label: "Close all windows" }
+              { value: "all", label: "Close all other windows" }
             ]
             delegate: Rectangle {
               required property var modelData

@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 printf 'Checking manifest JSON... '
-jq -e '.schemaVersion==1 and .id=="io.github.crispsimpcrispy.workflows" and .version=="0.2.1" and (.kinds|index("bar-widget")!=null) and .entryPoints.barWidget=="BarWidget.qml"' manifest.json >/dev/null
+jq -e '.schemaVersion==1 and .id=="io.github.crispsimpcrispy.workflows" and .version=="0.2.2" and (.kinds|index("bar-widget")!=null) and .entryPoints.barWidget=="BarWidget.qml"' manifest.json >/dev/null
 printf 'OK\n'
 
 printf 'Checking backend shell syntax... '
@@ -89,14 +89,42 @@ if grep -q 'close.*address:0x3' "$log"; then echo 'Unrelated terminal should not
 grep -q 'address:0x1' "$log" || { echo 'Expected Browser to be moved/reused'; exit 1; }
 printf '  current-workflow close + reuse: OK\n'
 
-# Close-all mode should close every mocked client.
-jq --arg id "$id" '(.workflows[]|select(.id==$id)|.shutdownMode)="all"' "$XDG_CONFIG_HOME/omarchy/workflows/workflows.json" >"$tmp/config.new"
+# Re-selecting the already-active Work workflow must be idempotent: no close
+# requests, no browser/Spotify relaunch, but existing windows are moved as needed.
+jq '.activeWorkflow="work" | (.workflows[]|select(.id=="work")|.shutdownMode)="all"' "$XDG_CONFIG_HOME/omarchy/workflows/workflows.json" >"$tmp/config.new"
+mv "$tmp/config.new" "$XDG_CONFIG_HOME/omarchy/workflows/workflows.json"
+: >"$log"
+./backend.sh run work >/dev/null
+if grep -q 'close.*address:' "$log"; then echo 'Same workflow must not close any windows'; exit 1; fi
+if grep -q 'exec_cmd.*omarchy-launch-browser\|\[workspace 1 silent\].*omarchy-launch-browser' "$log"; then echo 'Same workflow should reuse Browser, not relaunch it'; exit 1; fi
+if grep -q 'exec_cmd.*omarchy-launch-spotify\|\[workspace 4 silent\].*omarchy-launch-spotify' "$log"; then echo 'Same workflow should reuse Spotify, not relaunch it'; exit 1; fi
+printf '  same-workflow reconcile: OK\n'
+
+# Broad close mode closes all *other* windows, but target apps marked reusable
+# survive. Research targets Zotero only, so current Browser/Spotify/Terminal close
+# because none match Zotero.
+jq --arg id "$id" '.activeWorkflow="work" | (.workflows[]|select(.id==$id)|.shutdownMode)="all"' "$XDG_CONFIG_HOME/omarchy/workflows/workflows.json" >"$tmp/config.new"
 mv "$tmp/config.new" "$XDG_CONFIG_HOME/omarchy/workflows/workflows.json"
 : >"$log"
 ./backend.sh run "$id" >/dev/null
-for a in 0x1 0x2 0x3; do grep -q "address:$a" "$log" || { echo "Expected $a to close in all mode"; exit 1; }; done
+for a in 0x1 0x2 0x3; do grep -q "address:$a" "$log" || { echo "Expected $a to close in broad close mode"; exit 1; }; done
 grep -q 'gtk-launch' "$log" || { echo 'Expected desktop entry launch via gtk-launch'; exit 1; }
-printf '  close-all + desktop entry launch: OK\n'
+printf '  close-other + desktop entry launch: OK\n'
+
+# Broad close mode with a reusable Browser target must protect the existing
+# Browser while closing unrelated windows.
+jq '
+  .activeWorkflow="work"
+  | (.workflows[]|select(.id=="relax")|.shutdownMode)="all"
+  | (.workflows[]|select(.id=="relax")|.apps[]|select(.name=="Browser")|.match)="^chromium$"
+' "$XDG_CONFIG_HOME/omarchy/workflows/workflows.json" >"$tmp/config.new"
+mv "$tmp/config.new" "$XDG_CONFIG_HOME/omarchy/workflows/workflows.json"
+: >"$log"
+./backend.sh run relax >/dev/null
+if grep -q 'close.*address:0x1' "$log"; then echo 'Reusable Browser must survive broad close mode'; exit 1; fi
+grep -q 'close.*address:0x2' "$log" || { echo 'Spotify should close in broad close mode'; exit 1; }
+grep -q 'close.*address:0x3' "$log" || { echo 'Terminal should close in broad close mode'; exit 1; }
+printf '  close-other preserves reusable target: OK\n'
 
 if command -v omarchy >/dev/null 2>&1; then
   printf 'Running Omarchy manifest validation...\n'

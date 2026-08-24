@@ -247,6 +247,17 @@ first_existing_window() {
   window_matches_regex "$matcher" | head -n1
 }
 
+move_existing_windows() {
+  local matcher="$1" workspace="$2" addr found=1
+  [[ -n "$matcher" ]] || return 1
+  while IFS= read -r addr; do
+    [[ -n "$addr" ]] || continue
+    found=0
+    hypr_move_window "$workspace" "address:$addr"
+  done < <(window_matches_regex "$matcher")
+  return "$found"
+}
+
 app_identity() {
   local app="$1" desktop match name
   desktop="$(jq -r '.desktopId // ""' <<<"$app")"
@@ -293,9 +304,13 @@ reusable_target_addresses() {
 }
 
 close_all_windows() {
-  local addr
+  local target_apps="${1:-[]}" addr protected
+  protected="$(reusable_target_addresses "$target_apps")"
   while IFS= read -r addr; do
     [[ -n "$addr" ]] || continue
+    # `Reuse existing` is authoritative: even the broad shutdown mode keeps
+    # concrete windows required by the target workflow.
+    grep -Fxq "$addr" <<<"$protected" && continue
     hypr_close_window "address:$addr"
   done < <(clients_json | jq -r '.[].address // empty')
 }
@@ -348,14 +363,28 @@ count_current_workflow_windows() {
 
 count_close_for_target() {
   migrate_config
-  local id="${1:?workflow id required}" workflow mode apps
+  local id="${1:?workflow id required}" workflow mode apps active_id protected all_count protected_count
   workflow="$(jq -c --arg id "$id" '.workflows[]? | select(.id==$id)' "$CONFIG_FILE")"
   [[ -n "$workflow" ]] || fail "Unknown workflow: $id"
   mode="$(normalize_shutdown_mode "$(jq -r '.shutdownMode // "current"' <<<"$workflow")")"
   apps="$(jq -c '.apps // []' <<<"$workflow")"
+  active_id="$(jq -r '.activeWorkflow // ""' "$CONFIG_FILE")"
+
+  # Re-selecting the workflow that is already active is a reconcile operation,
+  # never a teardown/relaunch operation.
+  if [[ "$active_id" == "$id" ]]; then
+    echo 0
+    return 0
+  fi
+
   case "$mode" in
     keep) echo 0 ;;
-    all) count_windows ;;
+    all)
+      all_count="$(count_windows)"
+      protected="$(reusable_target_addresses "$apps")"
+      protected_count="$(grep -cve '^$' <<<"$protected" || true)"
+      (( all_count > protected_count )) && echo $((all_count - protected_count)) || echo 0
+      ;;
     current) count_current_workflow_windows "$apps" ;;
   esac
 }
@@ -391,17 +420,25 @@ run_workflow() {
   migrate_config
   require_cmd hyprctl
   require_cmd jq
-  local id="${1:?workflow id required}" workflow mode start_ws apps baseline app ws matcher reuse existing command desktop_id
+  local id="${1:?workflow id required}" workflow mode start_ws apps baseline app ws matcher reuse command desktop_id active_id same_workflow=false
   workflow="$(jq -c --arg id "$id" '.workflows[]? | select(.id==$id)' "$CONFIG_FILE")"
   [[ -n "$workflow" ]] || fail "Unknown workflow: $id"
   mode="$(normalize_shutdown_mode "$(jq -r '.shutdownMode // "current"' <<<"$workflow")")"
   start_ws="$(jq -r '.startWorkspace|tostring' <<<"$workflow")"
   apps="$(jq -c '.apps // []' <<<"$workflow")"
-  case "$mode" in
-    all) close_all_windows; sleep 1 ;;
-    current) close_current_workflow_windows "$apps"; sleep 1 ;;
-    keep) : ;;
-  esac
+  active_id="$(jq -r '.activeWorkflow // ""' "$CONFIG_FILE")"
+  [[ "$active_id" == "$id" ]] && same_workflow=true
+
+  # Selecting the workflow that is already active means "put this workflow
+  # back where it belongs".  Do not close anything first, regardless of its
+  # configured switch shutdown mode.
+  if [[ "$same_workflow" != "true" ]]; then
+    case "$mode" in
+      all) close_all_windows "$apps"; sleep 1 ;;
+      current) close_current_workflow_windows "$apps"; sleep 1 ;;
+      keep) : ;;
+    esac
+  fi
 
   baseline="$(mktemp "$STATE_DIR/.baseline.XXXXXX")"
   clients_json | jq -r '.[].address // empty' | sort -u >"$baseline"
@@ -412,9 +449,9 @@ run_workflow() {
     matcher="$(jq -r '.match // ""' <<<"$app")"
     reuse="$(jq -r '.reuseExisting != false' <<<"$app")"
     if [[ "$reuse" == "true" && -n "$matcher" ]]; then
-      existing="$(first_existing_window "$matcher")"
-      if [[ -n "$existing" ]]; then
-        hypr_move_window "$ws" "address:$existing"
+      # Reuse every matching window, not only the first one. This keeps, for
+      # example, multiple browser windows together on the workflow workspace.
+      if move_existing_windows "$matcher" "$ws"; then
         continue
       fi
     fi
@@ -430,7 +467,11 @@ run_workflow() {
   hypr_focus_workspace "$start_ws"
   rm -f "$baseline"
   atomic_jq '.activeWorkflow=$id' --arg id "$id"
-  printf 'Launched %s.\n' "$(jq -r '.name' <<<"$workflow")"
+  if [[ "$same_workflow" == "true" ]]; then
+    printf 'Reconciled %s.\n' "$(jq -r '.name' <<<"$workflow")"
+  else
+    printf 'Launched %s.\n' "$(jq -r '.name' <<<"$workflow")"
+  fi
 }
 
 capture_windows() {
